@@ -1,0 +1,137 @@
+# cloud-sync configuration
+#
+# Copy to ${XDG_CONFIG_HOME:-~/.config}/cloud-sync/config.toml and edit.
+# Loaded from the first of:
+#   1. --config PATH
+#   2. $CLOUD_SYNC_CONFIG
+#   3. ${XDG_CONFIG_HOME:-~/.config}/cloud-sync/config.toml
+#
+# Paths may use ~ and $ENV_VAR.  List your remotes with: rclone listremotes
+#
+# ── Which mode for which remote? ────────────────────────────────────────────
+#
+#   [[pair]]   Full sync.  The whole tree lives on disk and works offline.
+#              Use it when you edit the files regularly, need them on a plane,
+#              or want a local backup.  Costs disk space.
+#   [[mount]]  Network lookup.  Files are fetched on access and cached.
+#              Use it for large shares you only occasionally look into, or for
+#              anything too big to keep locally.  Needs a connection.
+#
+# Rule of thumb: if you would be annoyed to find it missing offline, make it a
+# pair.  If you would be annoyed to find it filling your disk, make it a mount.
+
+# ── Global settings ─────────────────────────────────────────────────────────
+# Every value below is a default - delete the ones you do not want to change.
+
+[settings]
+
+# Where rclone bisync keeps its listing/state files.
+listings_dir = "~/.cache/rclone/bisync"
+
+# Daemon log file (rotated).
+logfile = "~/.local/share/rclone/cloud-sync.log"
+
+# Seconds to wait after a local change before syncing, so saving a file in a
+# loop triggers one sync instead of ten.
+debounce = 1.0
+
+# Seconds between remote polls.  Local edits are picked up by inotify within
+# `debounce`, so this only needs to catch changes made elsewhere.  Do not set it
+# too low: one bisync run over a few thousand files can take minutes, and a
+# short interval means it never stops.
+remote_poll = 300
+
+# After a failed round the poll interval doubles until it reaches this cap, so a
+# remote that is down is retried at a sane rate.
+remote_poll_max = 1800
+
+# Seconds between OAuth token refreshes.  A remote untouched for ~90 days can
+# lose its refresh token entirely, which is why this also runs from a timer.
+token_refresh = 21600
+
+# Seconds between health checks of the [[mount]] entries.
+mount_poll = 60
+
+# A problem that persists is re-announced at most this often, so a broken mount
+# does not notify you every minute.
+notify_repeat = 21600
+
+# host:port for the cheap "is the cloud reachable at all" probe.  Point it at
+# your provider: graph.microsoft.com for OneDrive/SharePoint, or use
+# cloudflare.com for a generic reachability check.
+probe_host = "graph.microsoft.com"
+probe_port = 443
+
+# Log rotation.
+log_max_bytes = 5242880
+log_backups = 2
+
+# Flags passed to every `rclone bisync` invocation.
+#   --conflict-resolve newer   the newer side wins a conflict
+#   --conflict-loser num       the loser is kept as file.conflict1, never deleted
+#   --resilient --recover      let rclone survive its own interruptions
+bisync_opts = [
+    "--use-server-modtime",
+    "--transfers", "8",
+    "--metadata",
+    "--conflict-resolve", "newer",
+    "--conflict-loser", "num",
+    "--resilient",
+    "--recover",
+    "--max-lock", "15m",
+    "--verbose",
+]
+
+# Local paths matching any of these regexes are ignored by the file watcher.
+# Single-quoted TOML strings are literal, so backslashes need no escaping.
+# The defaults cover LibreOffice lock files, Office temp files, git and .tmp.
+exclude_patterns = ['\.~lock\.', '~\$', '\.git', '\.tmp$']
+
+# ── Full sync ───────────────────────────────────────────────────────────────
+# One block per remote you want mirrored to disk.  Add as many as you like.
+#
+# After adding a pair, establish its baseline once:
+#     cloud-sync --resync --pair "Work OneDrive"
+
+[[pair]]
+name   = "Work OneDrive"
+remote = "onedrive-work:"
+local  = "~/Documents/Cloud/work/OneDrive"
+
+# A pair may point at a subdirectory of a remote:
+# [[pair]]
+# name   = "Project Files"
+# remote = "sharepoint-team:Projects/2026"
+# local  = "~/Documents/Cloud/work/Projects-2026"
+
+# ── Network lookup ──────────────────────────────────────────────────────────
+# One block per remote you want available on demand instead of on disk.
+#
+# Each mount runs as an instance of the shared rclone-mount@.service template.
+# After adding or changing a mount:
+#     cloud-sync --export-mount-units
+#     systemctl --user enable --now rclone-mount@<instance>.service
+
+[[mount]]
+name       = "Team Documents"
+remote     = "sharepoint-team:"
+mountpoint = "~/Documents/Cloud/work/Team"
+
+# `instance` is the systemd instance name.  Derived from `name` when omitted
+# ("Team Documents" -> "team-documents"); set it explicitly to keep unit names
+# stable if you ever rename the mount.
+# instance = "team-docs"
+
+# `mount_opts` replaces the built-in defaults entirely, so repeat what you still
+# want.  The defaults are:
+#     --vfs-cache-mode writes --vfs-cache-max-age 24h --vfs-cache-max-size 20G
+#     --dir-cache-time 1h --poll-interval 1m --vfs-fast-fingerprint --no-modtime
+# mount_opts = [
+#     "--vfs-cache-mode", "full",     # cache reads too - faster re-reads, more disk
+#     "--dir-cache-time", "30m",
+#     "--poll-interval", "1m",
+# ]
+
+# `unit` overrides the template entirely, for a hand-written mount unit.  Such a
+# mount gets no generated EnvironmentFile and no drift check.
+# unit = "my-own-mount.service"

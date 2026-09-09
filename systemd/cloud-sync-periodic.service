@@ -1,0 +1,9 @@
+[Unit]
+Description=cloud-sync periodic fallback run
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cloud-sync --once
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloud-sync

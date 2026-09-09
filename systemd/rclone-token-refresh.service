@@ -1,0 +1,8 @@
+[Unit]
+Description=rclone token refresh for every configured remote
+
+[Service]
+Type=oneshot
+# The remote list comes from the sync-onedrive config, so it cannot drift out
+# of sync with the remotes that are actually in use.
+ExecStart=%h/.local/bin/cloud-sync --refresh-tokens

@@ -1,0 +1,6 @@
+# The real configuration is personal - only the example is tracked.
+config/config.toml
+
+__pycache__/
+*.pyc
+*.bak

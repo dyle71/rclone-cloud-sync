@@ -1,0 +1,1704 @@
+#!/usr/bin/env python3
+"""
+cloud-sync - keeps cloud remotes available locally, in one of two modes.
+
+Every setting lives in a TOML config file (see --config); nothing about the
+remotes, local paths, or directories is hardcoded here.
+
+  [[pair]]   Full sync.  One rclone remote <-> one local directory, kept in
+             step by 'rclone bisync'.  The whole tree lives on disk and works
+             offline.  All pairs share a single global lock and are processed
+             sequentially, so no two bisync runs ever overlap.
+  [[mount]]  Network lookup.  One rclone remote exposed as a FUSE mount, files
+             fetched on access.  The mount itself is run by its own systemd
+             unit; this daemon watches its health, reports it in --status and
+             notifies when it breaks or comes back.
+
+Config is loaded from the first of:
+  1. --config PATH
+  2. $CLOUD_SYNC_CONFIG
+  3. ${XDG_CONFIG_HOME:-~/.config}/cloud-sync/config.toml
+
+Modes:
+  (no args)     Daemon: initial sync of all pairs, then watch each local dir
+                for changes and poll all remotes every remote_poll seconds.
+                Background loops watch the mounts (mount_poll) and refresh the
+                OAuth tokens (token_refresh) of every configured remote.
+  --once        One-shot: bisync every pair once and exit with an aggregated
+                exit code (0 = all succeeded).  Used by the systemd timer.
+  --resync      Establish the bisync baseline.  Without further options it only
+                touches pairs that have no listings yet (safe first run);
+                --pair NAME targets one pair, --force re-baselines every pair.
+                A resync establishes the baseline WITHOUT transferring identical
+                files, but it is destructive on conflicts - hence never automatic.
+  --list        Print the configured pairs and mounts with their state, then exit.
+  --status      Health report: connectivity, baseline age, outcome of the last
+                run per pair, failures since the last success, the local files
+                modified since the baseline (i.e. not yet synced) and the state
+                of every mount.  Exit code 0 only if everything is healthy and
+                nothing is pending.
+  --diff        Live per-file comparison against the remote via 'rclone check'
+                (--quick = size only, --pair NAME = one pair, --limit N = cap
+                the printed paths).  Exit code 0 only if everything matches.
+  --refresh-tokens
+                Renew the OAuth token of every configured remote once and exit.
+
+  --status and --diff also accept --json for scripting/monitoring.
+
+Design notes / intentional behavior:
+  * Missing listings are a HARD failure in normal runs.  The daemon refuses to
+    sync and notifies once instead of silently resyncing - a wiped listings dir
+    must never trigger an unattended --resync.  Recover explicitly with --resync.
+  * rclone's own crash resilience is delegated to --resilient/--recover/--max-lock.
+  * Notifications are edge-triggered: one message per state change, a persisting
+    problem re-announced at most once per notify_repeat, and at most one entry
+    per topic in the notification centre.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import logging
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+# ── Config model ──────────────────────────────────────────────────────────────
+
+DEFAULT_SETTINGS = {
+    "listings_dir":  "~/.cache/rclone/bisync",
+    "logfile":       "~/.local/share/rclone/cloud-sync.log",
+    "debounce":      1.0,
+    "remote_poll":   30,
+    # On repeated failures the poll interval doubles until it reaches this cap,
+    # so a broken connection does not hammer the remote every 30 seconds.
+    "remote_poll_max": 900,
+    "token_refresh": 6 * 3600,
+    # Seconds between health checks of the [[mount]] entries.
+    "mount_poll": 60,
+    # A problem that persists is re-announced at most once per this interval.
+    "notify_repeat": 6 * 3600,
+    # host:port used for the cheap "is there internet at all" probe
+    "probe_host":    "graph.microsoft.com",
+    "probe_port":    443,
+    "log_max_bytes": 5 * 1024 * 1024,
+    "log_backups":   2,
+    "bisync_opts": [
+        "--use-server-modtime",
+        "--transfers", "8",
+        "--metadata",
+        "--conflict-resolve", "newer",
+        "--conflict-loser", "num",
+        "--resilient",
+        "--recover",
+        "--max-lock", "15m",
+        "--verbose",
+    ],
+    "exclude_patterns": [r"\.~lock\.", r"~\$", r"\.git", r"\.tmp$"],
+}
+
+# Flags used for a [[mount]] that does not set mount_opts of its own.
+#   --vfs-cache-mode writes  local writes are cached, then uploaded; the mode
+#                            that behaves like a normal disk for editing files
+#   --poll-interval 1m       pick up changes made elsewhere within a minute
+#                            instead of waiting for dir-cache-time to lapse
+#   --no-modtime             do not fetch mtimes just to list a directory
+DEFAULT_MOUNT_OPTS = [
+    "--vfs-cache-mode", "writes",
+    "--vfs-cache-max-age", "24h",
+    "--vfs-cache-max-size", "20G",
+    "--dir-cache-time", "1h",
+    "--poll-interval", "1m",
+    "--vfs-fast-fingerprint",
+    "--no-modtime",
+]
+
+# The systemd template unit that runs every mount, one instance per [[mount]].
+MOUNT_UNIT_TEMPLATE = "rclone-mount@{instance}.service"
+
+# Where --export-mount-units writes the per-mount EnvironmentFiles.  The mount
+# unit reads them from the same place via the %h and %i specifiers.
+MOUNTS_DIR = Path(os.path.expanduser(
+    os.environ.get("XDG_CONFIG_HOME") or "~/.config")) / "cloud-sync" / "mounts"
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slug(text: str) -> str:
+    """
+    A systemd-instance-safe name derived from a human label.
+
+    "Teams - IT Management" -> "teams-it-management".  Used as the default
+    instance name so a [[mount]] block needs nothing but name/remote/mountpoint.
+    """
+    return _SLUG_RE.sub("-", text.strip().lower()).strip("-") or "mount"
+
+
+@dataclass
+class Pair:
+    """One remote <-> local-directory sync relationship."""
+    name:   str    # human label used in logs and notifications
+    remote: str    # rclone remote, e.g. "onedrive-work:"
+    local:  Path   # local directory
+    # per-pair debounce state (daemon mode); not part of the config
+    _timer: "threading.Timer | None" = field(default=None, repr=False, compare=False)
+    _timer_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    @property
+    def session(self) -> str:
+        """rclone bisync session/listing base name for this pair."""
+        return f"{_canon(self.remote)}..{_canon(str(self.local))}"
+
+
+@dataclass
+class Mount:
+    """One remote exposed as a FUSE mount - available on demand, not on disk."""
+    name:       str        # human label used in logs and notifications
+    remote:     str        # rclone remote, e.g. "sharepoint-team:"
+    mountpoint: Path       # where it is mounted
+    instance:   str        # systemd template instance name, e.g. "team-docs"
+    opts:       list[str]  # flags passed to 'rclone mount'
+    unit:       str        # the unit that runs this mount
+
+    @property
+    def managed(self) -> bool:
+        """
+        True when this mount runs on the shared template unit.
+
+        A [[mount]] may name a hand-written unit instead; that one is the user's
+        business, so it gets no EnvironmentFile and no drift check.
+        """
+        return self.unit == MOUNT_UNIT_TEMPLATE.format(instance=self.instance)
+
+    @property
+    def env_file(self) -> Path:
+        """The EnvironmentFile the mount unit reads this mount's settings from."""
+        return MOUNTS_DIR / f"{self.instance}.env"
+
+    def env_contents(self) -> str:
+        """
+        What env_file must contain for the unit to mount this.
+
+        systemd expands neither ~ nor $VAR inside an EnvironmentFile value, so
+        the mountpoint is written out absolute.  MOUNT_OPTS is deliberately one
+        unquoted line: the unit references it as $MOUNT_OPTS, which systemd
+        splits into separate arguments on whitespace, while "${MOUNTPOINT}"
+        stays a single argument even when the path contains spaces.
+        """
+        return (f"# Generated by 'cloud-sync --export-mount-units' - do not edit.\n"
+                f"# Change the [[mount]] block in the config and re-run that command.\n"
+                f"REMOTE={self.remote}\n"
+                f"MOUNTPOINT={self.mountpoint}\n"
+                f"MOUNT_OPTS={' '.join(self.opts)}\n")
+
+
+@dataclass
+class Config:
+    listings_dir:     Path
+    logfile:          Path
+    debounce:         float
+    remote_poll:      int
+    remote_poll_max:  int
+    token_refresh:    int
+    mount_poll:       int
+    notify_repeat:    int
+    probe_host:       str
+    probe_port:       int
+    log_max_bytes:    int
+    log_backups:      int
+    bisync_opts:      list[str]
+    exclude_patterns: list[str]
+    pairs:            list[Pair]
+    mounts:           list[Mount]
+    source:           Path   # file the config was loaded from
+
+
+# The active configuration, populated by main() before any work happens.
+CFG: Config = None  # type: ignore[assignment]
+
+# rclone canonicalizes a path into a listing filename by replacing whitespace,
+# slashes, colons and glob chars with '_' after trimming surrounding slashes.
+# Session name = canon(path1) + ".." + canon(path2).  Verified against the .lst
+# files rclone produces in listings_dir.
+_CANON_RE = re.compile(r"[\s\\/:?*]")
+
+
+def _canon(s: str) -> str:
+    return _CANON_RE.sub("_", s.strip("/"))
+
+
+def _expand(value) -> Path:
+    return Path(os.path.expanduser(os.path.expandvars(str(value))))
+
+
+def config_path(explicit: "str | None") -> Path:
+    if explicit:
+        return _expand(explicit)
+    env = os.environ.get("CLOUD_SYNC_CONFIG")
+    if env:
+        return _expand(env)
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return _expand(base) / "cloud-sync" / "config.toml"
+
+
+def load_config(path: Path) -> Config:
+    if not path.is_file():
+        sys.exit(f"cloud-sync: no config file at {path}\n"
+                 f"Create one (see the template under .config/cloud-sync/config.toml) "
+                 f"or point --config / $CLOUD_SYNC_CONFIG at it.")
+
+    with path.open("rb") as fh:
+        data = tomllib.load(fh)
+
+    settings = {**DEFAULT_SETTINGS, **data.get("settings", {})}
+
+    raw_pairs = data.get("pair", [])
+    raw_mounts = data.get("mount", [])
+    if not raw_pairs and not raw_mounts:
+        sys.exit(f"cloud-sync: config {path} defines neither [[pair]] nor [[mount]] entries.")
+
+    pairs: list[Pair] = []
+    seen: dict[str, str] = {}
+    for i, entry in enumerate(raw_pairs):
+        for key in ("name", "remote", "local"):
+            if key not in entry:
+                sys.exit(f"cloud-sync: [[pair]] #{i + 1} in {path} is missing '{key}'.")
+        pair = Pair(name=str(entry["name"]), remote=str(entry["remote"]), local=_expand(entry["local"]))
+        if pair.session in seen:
+            sys.exit(f"cloud-sync: pairs '{seen[pair.session]}' and '{pair.name}' "
+                     f"map to the same bisync session - remote/local must be unique.")
+        seen[pair.session] = pair.name
+        pairs.append(pair)
+
+    mounts: list[Mount] = []
+    seen_mp: dict[str, str] = {}
+    seen_inst: dict[str, str] = {}
+    for i, entry in enumerate(raw_mounts):
+        for key in ("name", "remote", "mountpoint"):
+            if key not in entry:
+                sys.exit(f"cloud-sync: [[mount]] #{i + 1} in {path} is missing '{key}'.")
+        instance = str(entry.get("instance") or slug(str(entry["name"])))
+        if instance != slug(instance):
+            sys.exit(f"cloud-sync: instance '{instance}' of [[mount]] '{entry['name']}' is not a "
+                     f"valid systemd instance name (lowercase letters, digits and '-' only).")
+        # An explicit unit stays honoured so a hand-written mount unit keeps
+        # working; everything else runs on the shared template.
+        unit = str(entry["unit"]) if entry.get("unit") else \
+            MOUNT_UNIT_TEMPLATE.format(instance=instance)
+        mount = Mount(name=str(entry["name"]), remote=str(entry["remote"]),
+                      mountpoint=_expand(entry["mountpoint"]),
+                      instance=instance,
+                      opts=[str(o) for o in entry.get("mount_opts", DEFAULT_MOUNT_OPTS)],
+                      unit=unit)
+        mp = str(mount.mountpoint)
+        if mp in seen_mp:
+            sys.exit(f"cloud-sync: mounts '{seen_mp[mp]}' and '{mount.name}' "
+                     f"share the mountpoint {mp}.")
+        if instance in seen_inst:
+            sys.exit(f"cloud-sync: mounts '{seen_inst[instance]}' and '{mount.name}' both map to "
+                     f"instance '{instance}' - give one of them an explicit 'instance'.")
+        seen_inst[instance] = mount.name
+        # A mountpoint inside a synced pair would have bisync walk the network
+        # filesystem on every run - slow at best, a duplicated tree at worst.
+        for pair in pairs:
+            with contextlib.suppress(ValueError):
+                mount.mountpoint.relative_to(pair.local)
+                sys.exit(f"cloud-sync: mountpoint {mp} of '{mount.name}' lies inside "
+                         f"the synced directory of pair '{pair.name}'.")
+        seen_mp[mp] = mount.name
+        mounts.append(mount)
+
+    return Config(
+        listings_dir=_expand(settings["listings_dir"]),
+        logfile=_expand(settings["logfile"]),
+        debounce=float(settings["debounce"]),
+        remote_poll=int(settings["remote_poll"]),
+        remote_poll_max=max(int(settings["remote_poll_max"]), int(settings["remote_poll"])),
+        token_refresh=int(settings["token_refresh"]),
+        mount_poll=int(settings["mount_poll"]),
+        notify_repeat=int(settings["notify_repeat"]),
+        probe_host=str(settings["probe_host"]),
+        probe_port=int(settings["probe_port"]),
+        log_max_bytes=int(settings["log_max_bytes"]),
+        log_backups=int(settings["log_backups"]),
+        bisync_opts=list(settings["bisync_opts"]),
+        exclude_patterns=list(settings["exclude_patterns"]),
+        pairs=pairs,
+        mounts=mounts,
+        source=path,
+    )
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+log = logging.getLogger("cloud-sync")
+
+
+def setup_logging(cfg: Config) -> None:
+    cfg.logfile.parent.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter(fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    file_handler = RotatingFileHandler(cfg.logfile, maxBytes=cfg.log_max_bytes,
+                                       backupCount=cfg.log_backups, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(fmt)
+
+    log.setLevel(logging.DEBUG)
+    log.addHandler(file_handler)
+    log.addHandler(stream_handler)
+
+# ── Desktop notifications ─────────────────────────────────────────────────────
+
+#
+# Notifications are edge-triggered, never level-triggered.  The rule is:
+#
+#   * one notification per (key, state) TRANSITION - a failure that repeats
+#     every poll stays silent after the first message,
+#   * a persisting problem is re-announced at most once per notify_repeat,
+#   * every message for a key REPLACES the previous one (notify-send -r), so
+#     the notification centre holds at most one entry per key,
+#   * the state lives in a file under $XDG_RUNTIME_DIR, so the daemon, the
+#     --once timer run and any restart of either share it instead of each
+#     starting their own notification stream.
+#
+# Ephemeral by design: $XDG_RUNTIME_DIR is wiped on logout, so a fresh session
+# is allowed to tell you about a problem again.
+
+_NOTIFY_STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "cloud-sync" / "notify-state.json"
+_notify_lock = threading.Lock()
+
+
+def _notify_state_load() -> dict:
+    try:
+        return json.loads(_NOTIFY_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _notify_state_save(state: dict) -> None:
+    try:
+        _NOTIFY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _NOTIFY_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(_NOTIFY_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _notify_send(summary: str, body: str, urgency: str, icon: str,
+                 replace_id: int = 0, transient: bool = False) -> int:
+    """Fire notify-send and return the notification id (0 on any problem)."""
+    cmd = ["notify-send", "-p", "-a", "Cloud Sync", "-u", urgency]
+    if replace_id:
+        cmd += ["-r", str(replace_id)]
+    if icon:
+        cmd += ["-i", icon]
+    if transient:
+        # Toast only, no permanent entry in the notification centre.
+        cmd += ["-h", "byte:transient:1"]
+    cmd.append(summary)
+    if body:
+        cmd.append(body)
+    try:
+        r = subprocess.run(cmd, check=False, timeout=5, capture_output=True, text=True)
+        return int((r.stdout or "0").strip() or 0)
+    except Exception:
+        return 0
+
+
+def notify_state(key: str, state: str, summary: str, body: str = "",
+                 urgency: str = "low", icon: str = "", transient: bool = False) -> None:
+    """
+    Announce that `key` has entered `state` - but only if that is news.
+
+    `key` identifies the thing being reported on (a pair, a remote, the network),
+    `state` its condition ("ok", "fail:7", "offline", ...).  Re-entering the same
+    state is silent; "ok" is only reported when it follows a non-ok state, so a
+    healthy sync never notifies at all.
+    """
+    now = time.time()
+    repeat_after = CFG.notify_repeat if CFG else 6 * 3600
+    with _notify_lock:
+        allstates = _notify_state_load()
+        entry = allstates.get(key) or {}
+        prev = entry.get("state")
+        prev_id = int(entry.get("id") or 0)
+
+        if prev == state:
+            # Unchanged.  Healthy states never repeat; problems only after a while.
+            if state == "ok" or (now - float(entry.get("ts") or 0)) < repeat_after:
+                return
+        elif state == "ok" and prev is None:
+            # First ever run - record health silently, nothing to celebrate.
+            allstates[key] = {"state": state, "ts": now, "id": prev_id}
+            _notify_state_save(allstates)
+            return
+
+        new_id = _notify_send(summary, body, urgency, icon, prev_id, transient)
+        allstates[key] = {"state": state, "ts": now, "id": new_id or prev_id}
+        _notify_state_save(allstates)
+
+
+def notify_ok(key: str, summary: str, body: str = "") -> None:
+    """Clear a key's problem state; only visible if something was wrong before."""
+    notify_state(key, "ok", summary, body, urgency="low",
+                 icon="emblem-default", transient=True)
+
+# ── Connectivity ──────────────────────────────────────────────────────────────
+
+# rclone failures that mean "the network is gone", not "your data is in trouble".
+_NET_ERROR_RE = re.compile(
+    r"dial tcp|no such host|network is unreachable|connection refused|host is down|"
+    r"i/o timeout|context deadline exceeded|TLS handshake|temporary failure in name resolution|"
+    r"couldn't connect|connection reset by peer",
+    re.IGNORECASE,
+)
+
+
+def online() -> bool:
+    """Cheap TCP probe: is the cloud endpoint reachable at all?"""
+    try:
+        with socket.create_connection((CFG.probe_host, CFG.probe_port), timeout=4):
+            return True
+    except OSError:
+        return False
+
+# ── Lock / Listings helpers ───────────────────────────────────────────────────
+
+def listings_ok(pair: Pair) -> bool:
+    base = pair.session
+    return (CFG.listings_dir / f"{base}.path1.lst").exists() and (CFG.listings_dir / f"{base}.path2.lst").exists()
+
+
+def rclone_lock_owner(pair: Pair) -> "tuple[str, int]":
+    """
+    Who holds the rclone bisync lock for `pair`?
+
+    Returns (state, pid) with state one of 'none' (no lock), 'running' (the
+    owning process is alive), 'stale' (it is not) or 'unreadable'.
+    """
+    lck = CFG.listings_dir / f"{pair.session}.lck"
+    if not lck.exists():
+        return "none", 0
+    try:
+        pid = int(json.loads(lck.read_text())["PID"])
+    except Exception:
+        return "unreadable", 0
+    try:
+        os.kill(pid, 0)
+        return "running", pid
+    except ProcessLookupError:
+        return "stale", pid
+    except (PermissionError, ValueError):
+        return "running", pid
+
+
+def cleanup_stale_rclone_lock(pair: Pair) -> bool:
+    """
+    Remove a stale bisync lock file left behind by a previously killed process.
+
+    rclone bisync writes a JSON lock file containing the PID of the owner.
+    Returns True if it is safe to proceed, False if a live lock is held.
+    """
+    lck = CFG.listings_dir / f"{pair.session}.lck"
+    if not lck.exists():
+        return True
+
+    try:
+        data = json.loads(lck.read_text())
+        pid = int(data["PID"])
+    except Exception as exc:
+        log.warning("[%s] Could not parse bisync lock file (%s) - leaving it alone", pair.name, exc)
+        return False
+
+    # Check whether the owning process is still alive
+    try:
+        os.kill(pid, 0)
+        # Process is alive - a real bisync is running
+        log.warning("[%s] bisync lock held by running PID %d - skipping this run", pair.name, pid)
+        return False
+    except ProcessLookupError:
+        pass  # PID is dead -> stale lock
+    except PermissionError:
+        # PID exists but belongs to another user - treat as alive
+        log.warning("[%s] bisync lock held by PID %d (no permission to signal) - skipping", pair.name, pid)
+        return False
+
+    log.warning("[%s] Stale bisync lock found (PID %d is dead) - removing", pair.name, pid)
+    try:
+        subprocess.run(["rclone", "deletefile", str(lck)], check=False, timeout=15, capture_output=True)
+    except Exception:
+        lck.unlink(missing_ok=True)
+
+    return True
+
+# ── Bisync ────────────────────────────────────────────────────────────────────
+
+# Global lock: only one bisync runs at a time across all pairs and all threads.
+_bisync_lock = threading.Lock()
+
+
+class ShuttingDown(Exception):
+    """Raised inside a bisync when the daemon was asked to terminate."""
+
+
+# The rclone child of the currently running bisync, so shutdown can end it.
+# Without this a restart leaves an orphaned 'rclone bisync' behind that keeps
+# running, holds the bisync lock and collides with the newly started daemon.
+_child_lock = threading.Lock()
+_child: "subprocess.Popen | None" = None
+_shutting_down = threading.Event()
+
+
+def _run_rclone(cmd: "list[str]") -> subprocess.CompletedProcess:
+    """subprocess.run() for rclone, but the child is killable from shutdown()."""
+    global _child
+    if _shutting_down.is_set():
+        raise ShuttingDown
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    with _child_lock:
+        _child = proc
+    try:
+        out, err = proc.communicate()
+    finally:
+        with _child_lock:
+            _child = None
+    # We asked it to stop, so whatever it exited with is our doing, not a sync
+    # failure.  rclone catches SIGTERM and exits 143 rather than dying from the
+    # signal, so testing for a negative returncode alone would miss it and
+    # report a critical "bisync failed (rc=143)" on every restart.
+    if _shutting_down.is_set() and proc.returncode != 0:
+        raise ShuttingDown
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def terminate_child(timeout: float = 20.0) -> None:
+    """Ask a running rclone to stop; SIGKILL it if it will not. Safe to call twice."""
+    with _child_lock:
+        proc = _child
+    if proc is None or proc.poll() is not None:
+        return
+    log.info("Terminating running rclone (PID %d)", proc.pid)
+    with contextlib.suppress(Exception):
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.warning("rclone (PID %d) did not stop in %.0fs - killing", proc.pid, timeout)
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
+@contextlib.contextmanager
+def process_lock(pair: Pair):
+    """
+    Hold an exclusive flock for `pair` across the whole bisync, or yield False.
+
+    _bisync_lock only serializes threads inside one process.  The daemon and the
+    --once timer run are two processes, and rclone's own .lck is written after
+    bisync starts working - a window in which both can pass the stale-lock check
+    and then trip over each other (observed: two overlapping runs, one dying
+    with "Errors: 1").  An flock held for the entire run closes that window: it
+    is taken before rclone starts and released by the kernel even if we are
+    killed, so it can never go stale.
+    """
+    path = CFG.listings_dir / f"{pair.session}.cloud-sync.lock"
+    fh = None
+    try:
+        fh = path.open("a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            owner = ""
+            with contextlib.suppress(Exception):
+                fh.seek(0)
+                owner = fh.read().strip()
+            log.warning("[%s] Another cloud-sync run holds the lock%s - skipping",
+                        pair.name, f" ({owner})" if owner else "")
+            yield False
+            return
+        with contextlib.suppress(Exception):
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} started={time.time():.0f}\n")
+            fh.flush()
+        yield True
+    finally:
+        if fh is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+
+# Log lines worth keeping.  Matched case-insensitively so rclone's "Copied (new)",
+# "Deleted", "Renamed" etc. are no longer swallowed (the old filter was case-
+# sensitive and silently logged nothing but stats/errors).
+_LOG_KEYWORDS = ("transferred", "errors", "error", "warn", "copied", "deleted", "renamed", "resync")
+
+# Outcome of a single bisync attempt, ordered from harmless to fatal.  Only the
+# last two mean something is wrong with the data or the setup: 'locked' (another
+# run holds the lock) and 'offline' are ordinary states of a machine that syncs
+# continuously, and must not turn a --once run - and with it its systemd unit - red.
+RESULT_OK      = "ok"
+RESULT_LOCKED  = "locked"
+RESULT_OFFLINE = "offline"
+RESULT_UNINIT  = "uninit"
+RESULT_FAIL    = "fail"
+
+_RESULT_SEVERITY = {RESULT_OK: 0, RESULT_LOCKED: 1, RESULT_OFFLINE: 2,
+                    RESULT_UNINIT: 3, RESULT_FAIL: 4}
+
+_BENIGN_RESULTS = frozenset({RESULT_OK, RESULT_LOCKED, RESULT_OFFLINE})
+
+
+def worst_result(results) -> str:
+    """The most severe outcome in `results` (RESULT_OK for an empty sequence)."""
+    return max(results, key=lambda r: _RESULT_SEVERITY.get(r, 99), default=RESULT_OK)
+
+
+def do_bisync(pair: Pair, reason: str = "manual", resync: bool = False) -> str:
+    """
+    Run rclone bisync for one pair.  Returns one of the RESULT_* categories.
+
+    Missing listings are a hard failure unless resync=True is passed explicitly.
+    """
+    key = f"pair:{pair.name}"
+
+    # No network -> not a sync failure.  Report it once, globally, and get out
+    # before rclone spends 30 seconds discovering the same thing per pair.
+    if not online():
+        log.info("[%s] Offline - skipping bisync (reason: %s)", pair.name, reason)
+        notify_state("net", "offline", "Cloud sync paused",
+                     "No connection to the cloud - will resume automatically.",
+                     urgency="normal", icon="network-offline")
+        record_run(pair, RESULT_OFFLINE, reason)
+        return RESULT_OFFLINE
+    notify_ok("net", "Cloud sync", "Connection is back")
+
+    with _bisync_lock, process_lock(pair) as acquired:
+        if not acquired:
+            record_run(pair, RESULT_LOCKED, reason)
+            return RESULT_LOCKED
+
+        if not cleanup_stale_rclone_lock(pair):
+            record_run(pair, RESULT_LOCKED, reason)
+            return RESULT_LOCKED
+
+        opts = list(CFG.bisync_opts)
+
+        if resync:
+            opts.append("--resync")
+        elif not listings_ok(pair):
+            log.error("[%s] Listings missing - refusing to sync (reason: %s). "
+                      "Run 'cloud-sync --resync' to initialize.", pair.name, reason)
+            notify_state(key, "uninit", "Cloud sync not initialized",
+                         f"{pair.name}: no bisync baseline.\ncloud-sync --resync",
+                         urgency="critical", icon="dialog-error")
+            record_run(pair, RESULT_UNINIT, reason)
+            return RESULT_UNINIT
+
+        log.info("[%s] Starting bisync (reason: %s, resync: %s)", pair.name, reason, resync)
+
+        cmd = ["rclone", "bisync", pair.remote, str(pair.local)] + opts
+        try:
+            result = _run_rclone(cmd)
+        except ShuttingDown:
+            log.info("[%s] bisync interrupted by shutdown", pair.name)
+            record_run(pair, RESULT_LOCKED, reason)
+            return RESULT_LOCKED
+        output = result.stdout + result.stderr
+
+        # Log relevant lines only (case-insensitive match)
+        changed = 0
+        for line in output.splitlines():
+            low = line.lower()
+            if any(kw in low for kw in _LOG_KEYWORDS):
+                log.info("[%s]   %s", pair.name, line.strip())
+            if any(kw in low for kw in ("copied", "deleted", "renamed")):
+                changed += 1
+
+        if result.returncode != 0:
+            if _NET_ERROR_RE.search(output):
+                # Connection died mid-run: transient, and already covered by the
+                # global "offline" state.  Log it, do not alarm the user per pair.
+                log.warning("[%s] bisync aborted - network error (rc=%d)",
+                            pair.name, result.returncode)
+                notify_state("net", "offline", "Cloud sync paused",
+                             "Connection to the cloud dropped - retrying.",
+                             urgency="normal", icon="network-offline")
+                record_run(pair, RESULT_OFFLINE, reason, result.returncode)
+                return RESULT_OFFLINE
+
+            log.error("[%s] bisync failed (rc=%d)", pair.name, result.returncode)
+            notify_state(key, f"fail:{result.returncode}", "Cloud sync failed",
+                         f"{pair.name} (rc={result.returncode})\n"
+                         f"journalctl --user -u cloud-sync",
+                         urgency="critical", icon="dialog-error")
+            record_run(pair, RESULT_FAIL, reason, result.returncode)
+            return RESULT_FAIL
+
+        log.info("[%s] bisync ok", pair.name)
+        record_run(pair, RESULT_OK, reason, 0, changed)
+        notify_ok(key, "Cloud sync is back to normal", pair.name)
+        return RESULT_OK
+
+
+# ── Mount health ──────────────────────────────────────────────────────────────
+#
+# A FUSE mount fails in more ways than "is it mounted".  In rough order of how
+# often they bite:
+#
+#   ok         mounted and answering
+#   stale      mounted but hung - rclone lost the remote and every I/O blocks.
+#              os.path.ismount() still says yes, so this needs a real read with
+#              a timeout; it is the failure that looks like "my files froze".
+#   unmounted  nothing mounted there
+#   unit-failed  the systemd unit that runs the mount has given up
+#   shadowed   NOT mounted and the directory underneath is not empty.  Something
+#              wrote into the mountpoint while the mount was gone: those files
+#              are invisible once it is mounted again, and are lost on a cleanup.
+#              The one state that can cost data, hence reported as critical.
+
+MOUNT_OK, MOUNT_STALE, MOUNT_UNMOUNTED = "ok", "stale", "unmounted"
+MOUNT_UNIT_FAILED, MOUNT_SHADOWED = "unit-failed", "shadowed"
+# Mounted and fine, but its EnvironmentFile no longer matches the config: the
+# running mount uses stale settings until --export-mount-units and a restart.
+MOUNT_OUTDATED = "unit-outdated"
+
+_MOUNT_PROBE_TIMEOUT = 3.0
+
+# Last state logged per mount, so a persisting problem is logged once rather
+# than on every poll.  Notifications have their own, persistent state file.
+_last_mount_state: "dict[str, str]" = {}
+
+
+def _unit_active_state(unit: str) -> str:
+    """systemctl --user is-active <unit>, or 'unknown' if that cannot be asked."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", unit],
+                           capture_output=True, text=True, timeout=5)
+        return (r.stdout or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _probe_readable(path: Path, timeout: float = _MOUNT_PROBE_TIMEOUT) -> bool:
+    """
+    Can we list `path` within `timeout` seconds?
+
+    A hung FUSE mount blocks the calling thread indefinitely, so the read runs in
+    a throwaway daemon thread: if it does not come back in time we call the mount
+    stale and let the thread die with the process.
+    """
+    done = threading.Event()
+
+    def _read():
+        try:
+            with os.scandir(path) as it:
+                next(iter(it), None)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=_read, name="mount-probe", daemon=True).start()
+    return done.wait(timeout)
+
+
+def _dir_has_entries(path: Path) -> bool:
+    try:
+        with os.scandir(path) as it:
+            return next(iter(it), None) is not None
+    except Exception:
+        return False
+
+
+def mount_health(m: Mount) -> dict:
+    """Current state of one mount, cheapest check first."""
+    info = {"name": m.name, "remote": m.remote, "mountpoint": str(m.mountpoint),
+            "unit": m.unit, "unit_state": None, "state": MOUNT_OK}
+
+    if m.unit:
+        info["unit_state"] = _unit_active_state(m.unit)
+
+    if not m.mountpoint.exists():
+        info["state"] = MOUNT_UNMOUNTED
+        return info
+
+    if not os.path.ismount(m.mountpoint):
+        info["state"] = MOUNT_SHADOWED if _dir_has_entries(m.mountpoint) else MOUNT_UNMOUNTED
+        return info
+
+    if not _probe_readable(m.mountpoint):
+        info["state"] = MOUNT_STALE
+        return info
+
+    # Mounted and readable.  A failed unit on top of that is still worth saying.
+    if info["unit_state"] == "failed":
+        info["state"] = MOUNT_UNIT_FAILED
+    elif not env_file_current(m):
+        info["state"] = MOUNT_OUTDATED
+    return info
+
+
+_MOUNT_MESSAGE = {
+    MOUNT_UNMOUNTED:   ("Cloud drive unavailable", "is not mounted."),
+    MOUNT_STALE:       ("Cloud drive not responding", "stopped answering - connection lost?"),
+    MOUNT_UNIT_FAILED: ("Cloud drive degraded", "is mounted, but its systemd unit reports a failure."),
+    MOUNT_OUTDATED:    ("Cloud drive settings outdated",
+                        "runs with settings older than the config.\n"
+                        "cloud-sync --export-mount-units, then restart its unit."),
+    MOUNT_SHADOWED:    ("Warning: hidden local files",
+                        "is NOT mounted but its directory holds local files.\n"
+                        "They become invisible as soon as the drive is mounted again."),
+}
+
+
+def check_mount(m: Mount, offline: "bool | None" = None) -> str:
+    """Check one mount, remember and announce the result.  Returns the state."""
+    info = mount_health(m)
+    state = info["state"]
+    record_mount(m, state)
+
+    key = f"mount:{m.name}"
+    if state == MOUNT_OK:
+        notify_ok(key, "Cloud drive is back", m.name)
+        return state
+
+    # While the machine is offline every mount is down; that is one fact, not
+    # three, and the global "net" notification already carries it.
+    if state != MOUNT_SHADOWED and (offline if offline is not None else not online()):
+        log.info("[%s] mount %s - offline, not reporting separately", m.name, state)
+        return state
+
+    summary, detail = _MOUNT_MESSAGE[state]
+    body = f"{m.name} {detail}"
+    if m.unit:
+        body += f"\nsystemctl --user status {m.unit}"
+    # Warn on the transition, then keep quiet: a mount that stays down for a day
+    # would otherwise write 1440 identical WARNING lines into the journal.
+    level = logging.DEBUG if _last_mount_state.get(m.name) == state else logging.WARNING
+    log.log(level, "[%s] mount state: %s (unit: %s)", m.name, state, info["unit_state"])
+    _last_mount_state[m.name] = state
+    # Drift in the settings is a chore, not an outage: the mount still works.
+    urgency, icon = ("normal", "dialog-warning") if state == MOUNT_OUTDATED \
+        else ("critical", "dialog-error")
+    notify_state(key, state, summary, body, urgency=urgency, icon=icon)
+    return state
+
+
+def check_mounts() -> str:
+    """Check every configured mount.  Returns the most severe state seen."""
+    if not CFG.mounts:
+        return MOUNT_OK
+    offline = not online()
+    states = [check_mount(m, offline=offline) for m in CFG.mounts]
+    bad = [s for s in states if s != MOUNT_OK]
+    return bad[0] if bad else MOUNT_OK
+
+
+def env_file_current(m: Mount) -> bool:
+    """Does the mount's EnvironmentFile match what the config says it should be?"""
+    if not m.managed:
+        return True   # hand-written unit: nothing of ours to be out of date
+    try:
+        return m.env_file.read_text() == m.env_contents()
+    except OSError:
+        return False
+
+
+def export_mount_units(dry_run: bool = False) -> int:
+    """
+    Write one EnvironmentFile per [[mount]] so the template unit can mount it.
+
+    The config is the single source of truth; these files are derived from it.
+    Returns a process exit code: 0 unless something could not be written.
+    """
+    if not CFG.mounts:
+        print("No [[mount]] entries in the config - nothing to export.")
+        return 0
+
+    rc = 0
+    if not dry_run:
+        try:
+            MOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"cloud-sync: cannot create {MOUNTS_DIR}: {exc}")
+            return 1
+
+    for m in CFG.mounts:
+        if not m.managed:
+            print(f"  skipped    {m.name}: runs on its own unit ({m.unit})")
+            continue
+        if env_file_current(m):
+            print(f"  unchanged  {m.env_file}")
+            continue
+        if dry_run:
+            print(f"  would write {m.env_file}")
+            continue
+        try:
+            m.env_file.write_text(m.env_contents())
+            # It names a remote and a path, nothing secret, but there is no
+            # reason for anyone else on the machine to read it.
+            m.env_file.chmod(0o600)
+            print(f"  written    {m.env_file}")
+        except OSError as exc:
+            print(f"  FAILED     {m.env_file}: {exc}")
+            rc = 1
+
+    # Files for mounts that are no longer configured.  Removing them silently
+    # would leave an enabled unit pointing at a missing EnvironmentFile, so this
+    # only reports them and says what to do.
+    known = {m.env_file.name for m in CFG.mounts}
+    with contextlib.suppress(OSError):
+        for orphan in sorted(MOUNTS_DIR.glob("*.env")):
+            if orphan.name not in known:
+                instance = orphan.stem
+                print(f"\n  orphaned   {orphan}")
+                print(f"             no [[mount]] uses it any more.  To remove it:")
+                print(f"               systemctl --user disable --now "
+                      f"{MOUNT_UNIT_TEMPLATE.format(instance=instance)}")
+                print(f"               rm {shlex.quote(str(orphan))}")
+
+    if not dry_run:
+        print(f"\nEnable a mount with:  systemctl --user enable --now "
+              f"{MOUNT_UNIT_TEMPLATE.format(instance='<instance>')}")
+    return rc
+
+
+def mount_watch_loop(stop_event: threading.Event):
+    while not stop_event.wait(timeout=CFG.mount_poll):
+        try:
+            check_mounts()
+        except Exception:
+            log.exception("Mount check failed")
+
+
+def sync_all(reason: str, pairs: "list[Pair] | None" = None) -> str:
+    """Bisync every pair sequentially.  Returns the most severe RESULT_* seen."""
+    return worst_result([do_bisync(pair, reason)
+                         for pair in (pairs if pairs is not None else CFG.pairs)])
+
+# ── OAuth token refresh ───────────────────────────────────────────────────────
+
+def all_remotes() -> "list[str]":
+    """Every remote this config touches, pairs and mounts, without duplicates."""
+    return list(dict.fromkeys([p.remote for p in CFG.pairs] + [m.remote for m in CFG.mounts]))
+
+
+def refresh_tokens() -> bool:
+    """
+    Touch every remote so rclone renews the OAuth access token (and rewrites the
+    refresh token to the config).  A lightweight top-level listing is enough.
+
+    Returns False if a remote failed for a reason other than being offline.
+    """
+    ok = True
+    for remote in all_remotes():
+        try:
+            r = subprocess.run(["rclone", "lsd", remote, "--max-depth", "1"],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                log.debug("Token refresh ok: %s", remote)
+                notify_ok(f"token:{remote}", "Cloud sync - token renewed", remote)
+            elif _NET_ERROR_RE.search(r.stderr or ""):
+                log.info("Token refresh skipped for %s - offline", remote)
+            else:
+                log.warning("Token refresh failed for %s: %s", remote, r.stderr.strip())
+                notify_state(f"token:{remote}", f"fail:{r.returncode}", "Cloud sync - token expired",
+                             f"{remote}\nrclone config reconnect",
+                             urgency="normal", icon="dialog-warning")
+                ok = False
+        except Exception as exc:
+            log.warning("Token refresh error for %s: %s", remote, exc)
+            ok = False
+    return ok
+
+
+def token_refresh_loop(stop_event: threading.Event):
+    while not stop_event.wait(timeout=CFG.token_refresh):
+        refresh_tokens()
+
+# ── Watchdog (local changes) ──────────────────────────────────────────────────
+
+class ChangeHandler(FileSystemEventHandler):
+    """Per-pair debounced handler: waits debounce seconds after the last event."""
+
+    def __init__(self, pair: Pair):
+        super().__init__()
+        self._pair = pair
+
+    def _should_ignore(self, path: str) -> bool:
+        return any(re.search(pat, path) for pat in CFG.exclude_patterns)
+
+    def on_any_event(self, event):
+        if event.is_directory:
+            return
+        if self._should_ignore(event.src_path):
+            return
+
+        pair = self._pair
+        with pair._timer_lock:
+            if pair._timer is not None:
+                pair._timer.cancel()
+            pair._timer = threading.Timer(CFG.debounce, self._fire)
+            pair._timer.daemon = True
+            pair._timer.start()
+
+    def _fire(self):
+        pair = self._pair
+        with pair._timer_lock:
+            pair._timer = None
+        do_bisync(pair, "inotify")
+
+# ── Remote poll loop ──────────────────────────────────────────────────────────
+
+def remote_poll_loop(stop_event: threading.Event):
+    """
+    Polls all remotes until stop_event is set.
+
+    Healthy: every remote_poll seconds.  After a failed round the interval
+    doubles up to remote_poll_max, so a remote that is down (or a laptop in a
+    train tunnel) is retried at a sane rate instead of 120 times per hour.
+    """
+    delay = CFG.remote_poll
+    while not stop_event.wait(timeout=delay):
+        # 'locked' means the watcher beat us to it - that is a healthy round.
+        if sync_all("remote-poll") in (RESULT_OK, RESULT_LOCKED):
+            if delay != CFG.remote_poll:
+                log.info("Sync healthy again - poll interval back to %ds", CFG.remote_poll)
+            delay = CFG.remote_poll
+        else:
+            delay = min(delay * 2, CFG.remote_poll_max)
+            log.info("Sync round failed - next remote poll in %ds", delay)
+
+# ── Run status bookkeeping ────────────────────────────────────────────────────
+#
+# Unlike the notification state (ephemeral, $XDG_RUNTIME_DIR) this survives
+# reboots: it is the answer to "what did the sync actually do lately?".
+
+STATUS_FILE = _expand(Path(os.environ.get("XDG_STATE_HOME") or "~/.local/state") /
+                      "cloud-sync" / "status.json")
+_status_lock = threading.Lock()
+
+
+def _status_load() -> dict:
+    try:
+        return json.loads(STATUS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _status_save(data: dict) -> None:
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
+
+def record_run(pair: Pair, result: str, reason: str, rc: int = 0, changed: int = 0) -> None:
+    """Remember the outcome of one bisync attempt.  result: ok|fail|offline|locked|uninit."""
+    now = time.time()
+    with _status_lock:
+        data = _status_load()
+        pairs = data.setdefault("pairs", {})
+        entry = pairs.setdefault(pair.name, {})
+        entry.update(last_run=now, last_result=result, last_reason=reason, last_rc=rc)
+        if result == "ok":
+            entry["last_ok"] = now
+            entry["fails_since_ok"] = 0
+            if changed:
+                entry["last_change"] = now
+                entry["last_changed_files"] = changed
+        else:
+            entry["fails_since_ok"] = int(entry.get("fails_since_ok") or 0) + 1
+        _status_save(data)
+
+
+def record_mount(m: Mount, state: str) -> None:
+    """Remember the outcome of one mount health check."""
+    now = time.time()
+    with _status_lock:
+        data = _status_load()
+        entry = data.setdefault("mounts", {}).setdefault(m.name, {})
+        entry.update(last_check=now, state=state)
+        if state == MOUNT_OK:
+            entry["last_ok"] = now
+        _status_save(data)
+
+
+def record_daemon(running: bool) -> None:
+    with _status_lock:
+        data = _status_load()
+        data["daemon"] = {"pid": os.getpid(), "started": time.time()} if running else {}
+        _status_save(data)
+
+
+def _daemon_alive(info: dict) -> bool:
+    pid = int(info.get("pid") or 0)
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+
+
+def _ago(ts) -> str:
+    if not ts:
+        return "never"
+    delta = int(time.time() - float(ts))
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}min ago"
+    if delta < 86400:
+        return f"{delta // 3600}h {(delta % 3600) // 60}min ago"
+    return f"{delta // 86400}d {(delta % 86400) // 3600}h ago"
+
+
+def _stamp(ts) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts))) if ts else "-"
+
+
+def _listing_entries(pair: Pair) -> int:
+    """Number of files rclone recorded on the local side at the last sync."""
+    lst = CFG.listings_dir / f"{pair.session}.path2.lst"
+    try:
+        with lst.open("rb") as fh:
+            return max(sum(1 for _ in fh) - 1, 0)   # first line is the header
+    except Exception:
+        return 0
+
+
+def _local_changes_since(pair: Pair, since: float, cap: int = 5000) -> "tuple[int, list[str]]":
+    """
+    Files under the pair's local dir modified after `since`.
+
+    Purely local and instant - this is what "not yet synced" means offline.
+    Returns (count, up to 20 sample paths relative to the pair root).
+    """
+    count, sample = 0, []
+    for root, dirs, files in os.walk(pair.local):
+        dirs[:] = [d for d in dirs
+                   if not any(re.search(p, os.path.join(root, d)) for p in CFG.exclude_patterns)]
+        for name in files:
+            full = os.path.join(root, name)
+            if any(re.search(p, full) for p in CFG.exclude_patterns):
+                continue
+            try:
+                if os.lstat(full).st_mtime > since:
+                    count += 1
+                    if len(sample) < 20:
+                        sample.append(os.path.relpath(full, pair.local))
+            except OSError:
+                continue
+            if count >= cap:
+                return count, sample
+    return count, sample
+
+
+# ── Terminal styling ──────────────────────────────────────────────────────────
+#
+# Colour is decoration, never information: every state is also spelled out in
+# words, so a pipe, a log or a dumb terminal loses nothing.  Disabled when
+# stdout is not a TTY, when $NO_COLOR is set (no-color.org) or when $TERM is
+# "dumb", which is also what keeps --json and piped output clean.
+
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("TERM", "") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+COLOR = _use_color()
+
+_SGR = {
+    "reset": "0", "bold": "1", "dim": "2",
+    "red": "31", "green": "32", "yellow": "33", "blue": "34",
+    "magenta": "35", "cyan": "36", "grey": "90",
+}
+
+
+def c(text: str, *styles: str) -> str:
+    """Wrap text in SGR styles, or return it untouched when colour is off."""
+    if not COLOR or not styles:
+        return text
+    codes = ";".join(_SGR[s] for s in styles)
+    return f"\033[{codes}m{text}\033[0m"
+
+
+def label(text: str, width: int = 15) -> str:
+    """A dim, fixed-width field label so the values line up and stand out."""
+    return c(f"{text:<{width}}", "dim")
+
+
+def rule(title: str) -> str:
+    """A section heading: bold title padded out with a dim line."""
+    dashes = "─" * max(4, 62 - len(title) - 4)
+    return f"{c('──', 'grey')} {c(title, 'bold')} {c(dashes, 'grey')}"
+
+
+# Per state: emoji, the word, and the colour the word is printed in.  The emoji
+# is what the eye finds when scanning; the word is what a script or a colourless
+# terminal reads.
+_RESULT_STYLE = {
+    "ok":      ("✅", "OK",              "green"),
+    "fail":    ("❌", "FAILED",          "red"),
+    "offline": ("🔌", "OFFLINE",         "yellow"),
+    "locked":  ("🔒", "SYNC RUNNING",    "cyan"),
+    "uninit":  ("⚠️ ", "NOT INITIALIZED", "yellow"),
+    "-":       ("❔", "UNKNOWN",         "grey"),
+}
+
+_MOUNT_STYLE = {
+    MOUNT_OK:          ("✅", "OK",               "green"),
+    MOUNT_UNMOUNTED:   ("⛔", "NOT MOUNTED",      "red"),
+    MOUNT_STALE:       ("🧟", "STALE",            "red"),
+    MOUNT_UNIT_FAILED: ("❌", "UNIT FAILED",      "red"),
+    MOUNT_OUTDATED:    ("🔄", "SETTINGS OUTDATED", "yellow"),
+    MOUNT_SHADOWED:    ("🚨", "HIDDEN FILES",     "magenta"),
+}
+
+
+def _mark(styles: dict, key: str) -> str:
+    emoji, word, colour = styles.get(key, ("❔", key.upper(), "grey"))
+    return f"{emoji} {c(word, colour, 'bold')}"
+
+
+def print_status(as_json: bool = False) -> int:
+    """Instant, offline overview.  Exit code 0 = everything healthy."""
+    data = _status_load()
+    daemon = data.get("daemon") or {}
+    alive = _daemon_alive(daemon)
+    healthy = True
+    connected = online()
+    report = {"config": str(CFG.source),
+              "daemon": {"running": alive, "pid": daemon.get("pid"),
+                         "started": _stamp(daemon.get("started")) if alive else None},
+              "online": connected,
+              "probe": f"{CFG.probe_host}:{CFG.probe_port}",
+              "pairs": [], "mounts": []}
+    if not alive:
+        healthy = False
+
+    for pair in CFG.pairs:
+        entry = (data.get("pairs") or {}).get(pair.name, {})
+        lst = CFG.listings_dir / f"{pair.session}.path2.lst"
+        baseline_ts = lst.stat().st_mtime if lst.exists() else 0
+        initialized = listings_ok(pair)
+        # Anything touched after the baseline was written is by definition not
+        # yet reflected in the last successful sync.
+        pending, sample = _local_changes_since(pair, baseline_ts) if initialized else (0, [])
+        lock_state, lock_pid = rclone_lock_owner(pair)
+        result = entry.get("last_result") or ("uninit" if not initialized else "-")
+        # 'locked' just means a run was in flight - not a reason to call the
+        # pair unhealthy, or --status would fail at random during normal syncing.
+        if result not in (RESULT_OK, RESULT_LOCKED) or pending or not initialized:
+            healthy = False
+        if lock_state == "stale":
+            healthy = False
+        report["pairs"].append({
+            "name": pair.name, "remote": pair.remote, "local": str(pair.local),
+            "initialized": initialized, "baseline_files": _listing_entries(pair),
+            "baseline_written": _stamp(baseline_ts) if baseline_ts else None,
+            "last_result": result, "last_rc": entry.get("last_rc"),
+            "last_run": _stamp(entry.get("last_run")),
+            "last_run_ago": _ago(entry.get("last_run")),
+            "last_ok": _stamp(entry.get("last_ok")),
+            "next_poll": _stamp(float(entry["last_run"]) + CFG.remote_poll)
+                         if entry.get("last_run") and alive else None,
+            "fails_since_ok": int(entry.get("fails_since_ok") or 0),
+            "pending_local": pending, "pending_sample": sample,
+            "lock_state": lock_state, "lock_pid": lock_pid,
+        })
+
+    # Mount health is a live check - it is what "is the network drive there
+    # right now" means, and it costs milliseconds unless a mount hangs.
+    for m in CFG.mounts:
+        info = mount_health(m)
+        remembered = (data.get("mounts") or {}).get(m.name, {})
+        if info["state"] != MOUNT_OK:
+            healthy = False
+        report["mounts"].append({
+            **info,
+            "last_ok": _stamp(remembered.get("last_ok")),
+            "last_ok_ago": _ago(remembered.get("last_ok")),
+        })
+
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if healthy else 1
+
+    print(f"{label('Configuration')}{c(str(CFG.source), 'grey')}")
+    if alive:
+        pid = daemon.get("pid")
+        started = _stamp(daemon.get("started"))
+        uptime = _ago(daemon.get("started"))
+        detail = c(f"PID {pid}, up since {started} ({uptime})", "grey")
+        print(f"{label('Daemon')}✅ {c('running', 'green', 'bold')}  {detail}")
+    else:
+        print(f"{label('Daemon')}❌ {c('NOT running', 'red', 'bold')}  "
+              f"{c('systemctl --user start cloud-sync.service', 'grey')}")
+    if connected:
+        print(f"{label('Connection')}🌐 {c('online', 'green', 'bold')}  "
+              f"{c('(' + report['probe'] + ')', 'grey')}")
+    else:
+        print(f"{label('Connection')}🔌 {c('OFFLINE', 'yellow', 'bold')}  "
+              f"{c('(' + report['probe'] + ')', 'grey')}")
+
+    if report["pairs"]:
+        print()
+        print(rule("💾 Full sync"))
+    for p in report["pairs"]:
+        print()
+        print(f"{c(p['name'], 'bold', 'blue')}")
+        print(f"  {c(p['remote'] + '  →  ' + p['local'], 'grey')}")
+        if not p["initialized"]:
+            print(f"  {label('Baseline')}⚠️  {c('missing', 'yellow', 'bold')} "
+                  f"- run {c('cloud-sync --resync', 'bold')}")
+        else:
+            print(f"  {label('Baseline')}{p['baseline_files']} files, written {p['baseline_written']}")
+        detail = c(f" (rc={p['last_rc']})", "red") if p["last_result"] == "fail" and p["last_rc"] else ""
+        print(f"  {label('Last run')}{_mark(_RESULT_STYLE, p['last_result'])}{detail}  "
+              f"{p['last_run']}  {c('(' + p['last_run_ago'] + ')', 'grey')}")
+        if p["fails_since_ok"]:
+            n = p["fails_since_ok"]
+            attempts = f"{n} failed attempt" + ("" if n == 1 else "s")
+            print(f"  {label('')}{c(attempts, 'red')} "
+                  f"since the last success ({p['last_ok']})")
+        if p["pending_local"]:
+            shown = ", ".join(p["pending_sample"][:3])
+            more = f" …(+{p['pending_local'] - 3})" if p["pending_local"] > 3 else ""
+            print(f"  {label('Pending local')}⏳ {c(str(p['pending_local']) + ' file(s)', 'yellow', 'bold')} "
+                  f"changed since the baseline: {c(shown + more, 'grey')}")
+        else:
+            print(f"  {label('Pending local')}✅ {c('nothing waiting', 'green')}")
+        if p["lock_state"] == "running":
+            holder = c(f"(PID {p['lock_pid']})", "grey")
+            print(f"  {label('Lock')}🔒 {c('a sync is running right now', 'cyan')} {holder}")
+        elif p["lock_state"] == "stale":
+            print(f"  {label('Lock')}🧹 {c('STALE', 'yellow', 'bold')} "
+                  f"(PID {p['lock_pid']} no longer exists) - the next run removes it")
+        elif p["lock_state"] == "unreadable":
+            print(f"  {label('Lock')}❔ {c('present but unreadable', 'yellow')} - check it by hand")
+        if p["next_poll"] and p["lock_state"] != "running":
+            print(f"  {label('Next poll')}{c(p['next_poll'], 'grey')}")
+
+    if report["mounts"]:
+        print()
+        print(rule("🌐 Network lookup"))
+        for m in report["mounts"]:
+            print()
+            print(f"{c(m['name'], 'bold', 'blue')}  {_mark(_MOUNT_STYLE, m['state'])}")
+            print(f"  {c(m['remote'] + '  →  ' + m['mountpoint'], 'grey')}")
+            if m["unit"]:
+                ustate = m["unit_state"] or "?"
+                ucolor = "green" if ustate == "active" else "red"
+                print(f"  {label('Unit')}{m['unit']} {c('(' + ustate + ')', ucolor)}")
+            if m["state"] != MOUNT_OK:
+                print(f"  {label('Last ok')}{m['last_ok']} {c('(' + m['last_ok_ago'] + ')', 'grey')}")
+                if m["state"] == MOUNT_SHADOWED:
+                    print(f"  {label('WARNING')}🚨 {c('local files sit under the unmounted mountpoint', 'magenta', 'bold')}")
+                    print(f"  {label('')}{c('they become invisible once it is mounted - move them away first', 'magenta')}")
+                elif m["state"] == MOUNT_OUTDATED:
+                    print(f"  {label('Fix')}{c('cloud-sync --export-mount-units', 'bold')}"
+                          f"{c(', then systemctl --user restart ' + m['unit'], 'grey')}")
+
+    print()
+    print(c("Details: cloud-sync --diff   (real comparison against the cloud)", "grey"))
+    return 0 if healthy else 1
+
+# ── Live diff against the remote ──────────────────────────────────────────────
+
+# rclone check --combined marks every path with one of these.  path1 = remote
+# (source), path2 = local (destination) - same order as the bisync invocation.
+_COMBINED_LABEL = {
+    "+": ("only_remote", "only in the cloud"),
+    "-": ("only_local",  "only local"),
+    "*": ("differ",      "differing"),
+    "!": ("error",       "error while checking"),
+}
+
+
+def diff_pair(pair: Pair, limit: int = 50, quick: bool = False, as_json: bool = False) -> dict:
+    """Compare remote and local file by file via 'rclone check --combined'."""
+    cmd = ["rclone", "check", pair.remote, str(pair.local), "--combined", "-"]
+    if quick:
+        cmd.append("--size-only")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    buckets: dict[str, list[str]] = {k: [] for k in _COMBINED_LABEL}
+    same = 0
+    for line in result.stdout.splitlines():
+        if len(line) < 3 or line[1] != " ":
+            continue
+        mark, path = line[0], line[2:]
+        if mark == "=":
+            same += 1
+        elif mark in buckets:
+            buckets[mark].append(path)
+
+    out = {"pair": pair.name, "in_sync": same,
+           **{_COMBINED_LABEL[k][0]: v for k, v in buckets.items()}}
+
+    if not as_json:
+        differing = sum(len(v) for v in buckets.values())
+        print(f"\n{c(pair.name, 'bold', 'blue')}  "
+              f"{c('(' + pair.remote + ' ↔ ' + str(pair.local) + ')', 'grey')}")
+        if result.returncode != 0 and not any(buckets.values()) and same == 0:
+            print(f"  Comparison failed (rc={result.returncode}): "
+                  f"{(result.stderr or '').strip().splitlines()[-1] if result.stderr else 'unknown'}")
+            return out
+        verdict = f"✅ {c('everything matches', 'green', 'bold')}" if differing == 0 \
+            else f"⚠️  {c(str(differing) + ' differing', 'yellow', 'bold')}"
+        print(f"  {same} files identical, {verdict}"
+              f"{c('  (size comparison only)', 'grey') if quick else ''}")
+        for mark, (_key, text_label) in _COMBINED_LABEL.items():
+            paths = buckets[mark]
+            if not paths:
+                continue
+            print(f"  {c(text_label + f' ({len(paths)})', 'bold')}:")
+            for path in paths[:limit]:
+                print(f"    {mark} {path}")
+            if len(paths) > limit:
+                print(f"    … and {len(paths) - limit} more (raise --limit)")
+    return out
+
+
+# ── CLI helpers ───────────────────────────────────────────────────────────────
+
+def find_pair(token: str) -> "Pair | None":
+    """Match a --pair argument against a pair's label or remote (case-insensitive)."""
+    t = token.strip().lower()
+    for p in CFG.pairs:
+        if t in (p.name.lower(), p.remote.lower().rstrip(":")) or t in p.name.lower():
+            return p
+    return None
+
+
+def print_pairs() -> None:
+    if CFG.pairs:
+        print(rule("💾 Full sync"))
+    for p in CFG.pairs:
+        ok = listings_ok(p)
+        state = f"✅ {c('ready', 'green')}" if ok \
+            else f"⚠️  {c('needs --resync', 'yellow', 'bold')}"
+        print(f"  {c(p.name, 'bold', 'blue')}")
+        print(f"    {c(p.remote + '  →  ' + str(p.local), 'grey')}  {state}")
+    if CFG.mounts:
+        if CFG.pairs:
+            print()
+        print(rule("🌐 Network lookup"))
+    for m in CFG.mounts:
+        mounted = os.path.ismount(m.mountpoint)
+        state = f"✅ {c('mounted', 'green')}" if mounted \
+            else f"⛔ {c('not mounted', 'red', 'bold')}"
+        print(f"  {c(m.name, 'bold', 'blue')}")
+        print(f"    {c(m.remote + '  →  ' + str(m.mountpoint), 'grey')}  {state}")
+        print(f"    {c('unit ' + m.unit, 'grey')}")
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    global CFG
+
+    # Piping --status/--diff into head or less must not raise BrokenPipeError.
+    with contextlib.suppress(AttributeError, ValueError):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    parser = argparse.ArgumentParser(description="Keep cloud remotes available locally: bisync for full sync, rclone mount for network lookup")
+    parser.add_argument("--config", metavar="PATH", help="Config file (default: $CLOUD_SYNC_CONFIG or XDG path)")
+    parser.add_argument("--once", action="store_true", help="Bisync every pair once and exit (systemd timer)")
+    parser.add_argument("--resync", action="store_true", help="Establish the bisync baseline (see --pair/--force)")
+    parser.add_argument("--pair", metavar="NAME", help="Restrict --resync to one pair (label or remote name)")
+    parser.add_argument("--force", action="store_true", help="With --resync: re-baseline every pair, even initialized ones")
+    parser.add_argument("--list", action="store_true", help="List configured pairs and mounts, then exit")
+    parser.add_argument("--refresh-tokens", action="store_true",
+                        help="Renew the OAuth token of every configured remote once and exit")
+    parser.add_argument("--export-mount-units", action="store_true",
+                        help="Write the per-mount EnvironmentFiles the mount units read, then exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --export-mount-units: show what would be written")
+    parser.add_argument("--status", action="store_true",
+                        help="Show connectivity, sync state, last results, pending local changes and mount health")
+    parser.add_argument("--diff", action="store_true",
+                        help="Compare every pair against its remote file by file (needs network)")
+    parser.add_argument("--quick", action="store_true",
+                        help="With --diff: compare by size only instead of hashing (much faster)")
+    parser.add_argument("--limit", type=int, default=50, metavar="N",
+                        help="With --diff: max paths printed per category (default: 50)")
+    parser.add_argument("--json", action="store_true",
+                        help="With --status/--diff: machine-readable output")
+    args = parser.parse_args()
+
+    CFG = load_config(config_path(args.config))
+    setup_logging(CFG)
+
+    # Query modes print structured output - keep the console handler out of it.
+    if args.list or args.status or args.diff or args.export_mount_units:
+        for handler in log.handlers:
+            if getattr(handler, "stream", None) is sys.stdout:
+                handler.setLevel(logging.WARNING)
+
+    if args.list:
+        print_pairs()
+        return
+
+    if args.export_mount_units:
+        sys.exit(export_mount_units(dry_run=args.dry_run))
+
+    if args.refresh_tokens:
+        if not online():
+            log.info("Offline - nothing to refresh")
+            return
+        sys.exit(0 if refresh_tokens() else 1)
+
+    if args.status:
+        sys.exit(print_status(as_json=args.json))
+
+    if args.diff:
+        targets = CFG.pairs
+        if args.pair:
+            target = find_pair(args.pair)
+            if target is None:
+                log.error("No pair matches --pair %r. Known pairs:", args.pair)
+                print_pairs()
+                sys.exit(2)
+            targets = [target]
+        if not online():
+            print("No network access to the cloud - --diff needs a connection.")
+            sys.exit(2)
+        reports = [diff_pair(p, limit=args.limit, quick=args.quick, as_json=args.json)
+                   for p in targets]
+        if args.json:
+            print(json.dumps(reports, indent=2, ensure_ascii=False))
+        clean = all(not any(v for k, v in r.items() if isinstance(v, list)) for r in reports)
+        sys.exit(0 if clean else 1)
+
+    # Ensure every local directory and the listings dir exist before touching rclone.
+    CFG.listings_dir.mkdir(parents=True, exist_ok=True)
+    for p in CFG.pairs:
+        p.local.mkdir(parents=True, exist_ok=True)
+
+    # ── Explicit resync / initialization ────────────────────────────────────
+    if args.resync:
+        if args.pair:
+            target = find_pair(args.pair)
+            if target is None:
+                log.error("No pair matches --pair %r. Known pairs:", args.pair)
+                print_pairs()
+                sys.exit(2)
+            targets = [target]
+        elif args.force:
+            targets = list(CFG.pairs)
+        else:
+            # Safe default: only initialize pairs that have no baseline yet.
+            targets = [p for p in CFG.pairs if not listings_ok(p)]
+            if not targets:
+                log.info("All pairs already initialized - nothing to resync (use --force to override).")
+                return
+
+        log.info("Resync of: %s", ", ".join(p.name for p in targets))
+        results = [do_bisync(p, "resync", resync=True) for p in targets]
+        sys.exit(0 if worst_result(results) == RESULT_OK else 1)
+
+    # ── One-shot ─────────────────────────────────────────────────────────────
+    if args.once:
+        # A run the daemon locked out, or one skipped because the machine is
+        # offline, is not a failure - reporting it as one keeps the timer unit
+        # permanently red and buries the failures that do matter.
+        outcome = sync_all("periodic-timer")
+        if outcome != RESULT_OK:
+            log.info("One-shot finished with worst result: %s", outcome)
+        sys.exit(0 if outcome in _BENIGN_RESULTS else 1)
+
+    # ── Daemon mode ──────────────────────────────────────────────────────────
+    log.info("Starting cloud sync daemon (%d pairs, %d mounts, config: %s)",
+             len(CFG.pairs), len(CFG.mounts), CFG.source)
+    for p in CFG.pairs:
+        log.info("  pair:  %s  (%s -> %s)", p.name, p.remote, p.local)
+    for m in CFG.mounts:
+        log.info("  mount: %s  (%s -> %s)", m.name, m.remote, m.mountpoint)
+
+    record_daemon(True)
+
+    # Initial sync of all pairs, and a first look at the mounts, before the
+    # loops start - a mount that failed at boot must not stay unnoticed for a
+    # full mount_poll interval.
+    sync_all("startup")
+    check_mounts()
+
+    stop_event = threading.Event()
+
+    poll_thread = threading.Thread(target=remote_poll_loop, args=(stop_event,), name="remote-poll", daemon=True)
+    poll_thread.start()
+
+    token_thread = threading.Thread(target=token_refresh_loop, args=(stop_event,), name="token-refresh", daemon=True)
+    token_thread.start()
+
+    mount_thread = None
+    if CFG.mounts:
+        mount_thread = threading.Thread(target=mount_watch_loop, args=(stop_event,),
+                                        name="mount-watch", daemon=True)
+        mount_thread.start()
+
+    # One filesystem watcher per local directory.
+    observer = Observer()
+    for p in CFG.pairs:
+        observer.schedule(ChangeHandler(p), str(p.local), recursive=True)
+        log.info("Watching %s for local changes (debounce: %ss)", p.local, CFG.debounce)
+    observer.start()
+
+    # Graceful shutdown on SIGTERM / SIGINT
+    def shutdown(signum, _frame):
+        log.info("Received signal %d - shutting down", signum)
+        _shutting_down.set()
+        stop_event.set()
+        observer.stop()
+        # End the rclone child too, otherwise it outlives us, keeps the bisync
+        # lock and collides with the daemon systemd starts in our place.
+        terminate_child()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    try:
+        observer.join()
+    finally:
+        stop_event.set()
+        poll_thread.join(timeout=5)
+        token_thread.join(timeout=5)
+        if mount_thread is not None:
+            mount_thread.join(timeout=5)
+        record_daemon(False)
+        log.info("Shutdown complete")
+
+
+if __name__ == "__main__":
+    main()

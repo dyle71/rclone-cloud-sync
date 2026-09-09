@@ -1,0 +1,38 @@
+# One instance per [[mount]] in the cloud-sync config.
+#
+#   systemctl --user enable --now rclone-mount@<instance>.service
+#
+# The instance name selects an EnvironmentFile written by
+# 'cloud-sync --export-mount-units', which supplies REMOTE, MOUNTPOINT and
+# MOUNT_OPTS.  Nothing here is specific to a remote or a user, so this single
+# unit serves every mount.
+#
+# Quoting matters: "${MOUNTPOINT}" stays one argument even when the path
+# contains spaces, while a bare $MOUNT_OPTS is split into separate arguments.
+#
+# On purpose NOT here: After=/Wants=network-online.target.  That target does not
+# exist in the systemd *user* manager (`systemctl --user list-unit-files
+# network-online.target` lists nothing), so depending on it silently does
+# nothing while looking like it waits for the network.  Instead the unit fails
+# fast when the remote is unreachable and is retried until it works.
+
+[Unit]
+Description=rclone mount %I
+Documentation=https://rclone.org/commands/rclone_mount/
+
+[Service]
+Type=notify
+EnvironmentFile=%h/.config/cloud-sync/mounts/%i.env
+ExecStartPre=/usr/bin/mkdir -p "${MOUNTPOINT}"
+ExecStart=/usr/bin/rclone mount "${REMOTE}" "${MOUNTPOINT}" $MOUNT_OPTS
+# -z (lazy) so a stop does not fail while a file is still open.
+ExecStop=/bin/fusermount -uz "${MOUNTPOINT}"
+# Type=notify means systemd waits for rclone to report the mount as ready.
+# Without a bound it waits forever on a machine that booted without network.
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

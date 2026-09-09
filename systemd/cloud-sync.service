@@ -1,0 +1,22 @@
+[Unit]
+Description=cloud-sync daemon (bisync + mount watch)
+# No network-online.target dependency: that target does not exist in the systemd
+# *user* manager, so it would be silently ignored.  The daemon probes for
+# connectivity itself and backs off while offline, which is what makes it
+# correct to start regardless of network state.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+ExecStart=%h/.local/bin/cloud-sync
+Restart=always
+RestartSec=30
+# A bisync in flight is given time to be terminated cleanly on stop/restart,
+# otherwise systemd kills us while an rclone child still holds the sync lock.
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloud-sync
+
+[Install]
+WantedBy=default.target
