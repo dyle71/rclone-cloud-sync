@@ -26,7 +26,7 @@ say "Checking prerequisites"
 [[ "$(uname -s)" == "Linux" ]] || die "cloud-sync targets Linux (systemd + FUSE). See the README section 'Other platforms'."
 
 command -v systemctl >/dev/null || die "systemctl not found - this needs systemd."
-systemctl --user show-environment >/dev/null 2>&1 || die "no systemd user session (try: loginctl enable-linger $USER)"
+systemctl --user show-environment >/dev/null 2>&1 || die "no systemd user session (try: loginctl enable-linger ${USER:-$(id -un)})"
 ok "systemd user session"
 
 command -v rclone >/dev/null || die "rclone not found - install it from https://rclone.org/install/"
