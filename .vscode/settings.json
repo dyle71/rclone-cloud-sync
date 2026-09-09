@@ -1,4 +1,10 @@
 {
+  "//": "bin/cloud-sync has no .py extension, so tell the editor what it is.",
+  "files.associations": {
+    "cloud-sync": "python"
+  },
+  "//interpreter": "Pylance resolves 'watchdog' only once it knows the interpreter; the system python3 already has ~/.local/lib/pythonX.Y/site-packages on its path.",
+  "python.defaultInterpreterPath": "/usr/bin/python3",
   "cSpell.words": [
     "bisync",
     "fusermount",
@@ -7,10 +13,11 @@
     "logfile",
     "modtime",
     "mountpoint",
+    "mtimes",
     "oneshot",
     "pycache",
-    "Referer",
     "rclone",
+    "Referer",
     "systemctl",
     "tomllib",
     "watchdog"

@@ -8,7 +8,7 @@ status command that tells you the truth about all of it.
 > ideas behind it port to Windows and macOS without much trouble; see
 > [Other platforms](#other-platforms). The code as shipped does not.
 
-```
+```text
 $ cloud-sync --status
 Configuration  ~/.config/cloud-sync/config.toml
 Daemon         ✅ running  PID 614620, up since 2026-09-09 14:33:51 (2h 14min ago)
@@ -45,14 +45,14 @@ That assembly is what this repository is.
 Each remote is set up in one of two ways, and picking the right one per remote is
 the whole point.
 
-| | **Full sync** | **Network lookup** |
-|---|---|---|
-| config block | `[[pair]]` | `[[mount]]` |
-| mechanism | `rclone bisync` | `rclone mount` (FUSE) |
-| where files live | on your disk | on the server, cached |
-| works offline | yes | no |
-| disk cost | the full tree | cache only |
-| good for | what you edit daily, what you need on a plane | large shares you occasionally open |
+|                  | **Full sync**                                 | **Network lookup**                 |
+| ---------------- | --------------------------------------------- | ---------------------------------- |
+| config block     | `[[pair]]`                                    | `[[mount]]`                        |
+| mechanism        | `rclone bisync`                               | `rclone mount` (FUSE)              |
+| where files live | on your disk                                  | on the server, cached              |
+| works offline    | yes                                           | no                                 |
+| disk cost        | the full tree                                 | cache only                         |
+| good for         | what you edit daily, what you need on a plane | large shares you occasionally open |
 
 Rule of thumb: if you would be annoyed to find it **missing offline**, make it a
 pair. If you would be annoyed to find it **filling your disk**, make it a mount.
@@ -68,14 +68,16 @@ notified through the same edge-triggered logic.
 - **Python** ≥ 3.11 (for `tomllib`) with the **watchdog** module
   - Arch: `pacman -S python-watchdog`
   - Debian/Ubuntu: `apt install python3-watchdog`
-  - otherwise: `pip install --user watchdog`
+  - otherwise: `pip install --user -r requirements.txt`
 
 `install.sh` checks all of this and stops with a clear message if something is
 missing.
 
 ## Quick start
 
-**1. Set up a remote in rclone.** This is the only step that needs a browser.
+### 1. Set up a remote in rclone
+
+This is the only step that needs a browser.
 
 ```bash
 rclone config
@@ -88,7 +90,7 @@ For SharePoint document libraries, choose the same `onedrive` backend and pick
 the site when asked. rclone's
 [OneDrive docs](https://rclone.org/onedrive/) cover the tenant-specific cases.
 
-**2. Install.**
+### 2. Install
 
 ```bash
 git clone https://github.com/<you>/rclone-cloud-sync.git
@@ -96,7 +98,9 @@ cd rclone-cloud-sync
 ./install.sh          # writes a starter config on the first run
 ```
 
-**3. Describe what you want** in `~/.config/cloud-sync/config.toml`:
+### 3. Describe what you want
+
+In `~/.config/cloud-sync/config.toml`:
 
 ```toml
 [[pair]]
@@ -113,7 +117,7 @@ mountpoint = "~/Documents/Cloud/work/Team"
 The commented [`config/config.toml.example`](config/config.toml.example)
 documents every option.
 
-**4. Establish the baseline for each pair — once.**
+### 4. Establish the baseline for each pair — once
 
 ```bash
 cloud-sync --resync
@@ -123,7 +127,7 @@ cloud-sync --resync
 does not re-upload identical files, but it *is* the one destructive-on-conflict
 operation, which is why it is never automatic.
 
-**5. Start everything.**
+### 5. Start everything
 
 ```bash
 ./install.sh          # again: exports mount units, enables and starts them
@@ -155,7 +159,7 @@ when `NO_COLOR` is set.
 Mounts do **not** get one unit each. There is a single template unit,
 `rclone-mount@.service`, and one instance per mount:
 
-```
+```text
 config.toml                     ← you edit only this
     [[mount]] name = "Team Documents"
         │
@@ -185,7 +189,7 @@ systemctl --user restart rclone-mount@team-documents.service
 
 ## Switching a remote between modes
 
-**Network lookup → full sync**
+### Network lookup → full sync
 
 ```bash
 systemctl --user disable --now rclone-mount@team-documents.service
@@ -195,7 +199,7 @@ cloud-sync --resync --pair "Team Documents"
 systemctl --user restart cloud-sync.service
 ```
 
-**Full sync → network lookup**
+### Full sync → network lookup
 
 ```bash
 systemctl --user stop cloud-sync.service
@@ -207,12 +211,12 @@ systemctl --user start cloud-sync.service
 
 ## Units
 
-| Unit | Role |
-|---|---|
-| `cloud-sync.service` | the daemon: syncs at startup, then inotify + remote polling + mount watching + token refresh |
-| `cloud-sync-periodic.timer` | hourly `--once` fallback, in case a thread inside the daemon dies |
-| `rclone-token-refresh.timer` | daily token refresh for every remote in the config |
-| `rclone-mount@.service` | template, one instance per `[[mount]]` |
+| Unit                         | Role                                                                                         |
+| ---------------------------- | -------------------------------------------------------------------------------------------- |
+| `cloud-sync.service`         | the daemon: syncs at startup, then inotify + remote polling + mount watching + token refresh |
+| `cloud-sync-periodic.timer`  | hourly `--once` fallback, in case a thread inside the daemon dies                            |
+| `rclone-token-refresh.timer` | daily token refresh for every remote in the config                                           |
+| `rclone-mount@.service`      | template, one instance per `[[mount]]`                                                       |
 
 ## Notifications
 
@@ -231,14 +235,14 @@ at logout, so a fresh session is allowed to warn you once again.
 
 ## Troubleshooting
 
-| `--status` says | Meaning and fix |
-|---|---|
-| `⚠️ Baseline missing` | never initialized: `cloud-sync --resync` |
-| `🧹 Lock STALE` | leftover from a crash; the next run clears it |
-| `🔄 SETTINGS OUTDATED` | config changed without re-export: `cloud-sync --export-mount-units`, then restart the unit |
-| `🧟 STALE` (mount) | the mount hangs: `systemctl --user restart rclone-mount@<instance>.service` |
-| `🚨 HIDDEN FILES` | **data at risk**: something wrote into an unmounted mountpoint. Those files vanish from view once it mounts. Move them out, empty the directory, then mount |
-| `token expired` | `rclone config reconnect <remote>:` |
+| `--status` says        | Meaning and fix                                                                                                                                             |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `⚠️ Baseline missing`  | never initialized: `cloud-sync --resync`                                                                                                                    |
+| `🧹 Lock STALE`        | leftover from a crash; the next run clears it                                                                                                               |
+| `🔄 SETTINGS OUTDATED` | config changed without re-export: `cloud-sync --export-mount-units`, then restart the unit                                                                  |
+| `🧟 STALE` (mount)     | the mount hangs: `systemctl --user restart rclone-mount@<instance>.service`                                                                                 |
+| `🚨 HIDDEN FILES`      | **data at risk**: something wrote into an unmounted mountpoint. Those files vanish from view once it mounts. Move them out, empty the directory, then mount |
+| `token expired`        | `rclone config reconnect <remote>:`                                                                                                                         |
 
 Conflicts are resolved with `--conflict-resolve newer`; the losing version is
 kept as `file.conflict1` and never deleted.
@@ -248,14 +252,14 @@ Logs: `journalctl --user -u cloud-sync -f` or
 
 ## Files it owns
 
-| Path | Content |
-|---|---|
-| `~/.config/cloud-sync/config.toml` | your configuration |
-| `~/.config/cloud-sync/mounts/*.env` | generated, one per mount |
-| `~/.local/state/cloud-sync/status.json` | last run per pair, mount states (survives reboots) |
-| `$XDG_RUNTIME_DIR/cloud-sync/notify-state.json` | notification state (ephemeral) |
-| `~/.cache/rclone/bisync/` | bisync baselines and locks |
-| `~/.local/share/rclone/cloud-sync.log` | rotating log, 5 MB × 3 |
+| Path                                            | Content                                            |
+| ----------------------------------------------- | -------------------------------------------------- |
+| `~/.config/cloud-sync/config.toml`              | your configuration                                 |
+| `~/.config/cloud-sync/mounts/*.env`             | generated, one per mount                           |
+| `~/.local/state/cloud-sync/status.json`         | last run per pair, mount states (survives reboots) |
+| `$XDG_RUNTIME_DIR/cloud-sync/notify-state.json` | notification state (ephemeral)                     |
+| `~/.cache/rclone/bisync/`                       | bisync baselines and locks                         |
+| `~/.local/share/rclone/cloud-sync.log`          | rotating log, 5 MB × 3                             |
 
 `./uninstall.sh` removes the units and unmounts everything, and touches none of
 the above.
@@ -310,13 +314,13 @@ What is not: systemd units, `notify-send`, `flock`, inotify via `watchdog`
 
 ### Windows
 
-| Linux piece | Windows equivalent |
-|---|---|
+| Linux piece       | Windows equivalent                                                             |
+| ----------------- | ------------------------------------------------------------------------------ |
 | systemd user unit | Task Scheduler task *At log on*, or [NSSM](https://nssm.cc) for a real service |
-| FUSE | [WinFsp](https://winfsp.dev) — `rclone mount` maps a remote to a drive letter |
-| `notify-send` | `New-BurntToastNotification`, or PowerShell toast XML |
-| `flock` | `msvcrt.locking`, or a named mutex |
-| `journalctl` | Event Log, or just the rotating log file |
+| FUSE              | [WinFsp](https://winfsp.dev) — `rclone mount` maps a remote to a drive letter  |
+| `notify-send`     | `New-BurntToastNotification`, or PowerShell toast XML                          |
+| `flock`           | `msvcrt.locking`, or a named mutex                                             |
+| `journalctl`      | Event Log, or just the rotating log file                                       |
 
 `rclone mount X: --volname Team` giving a real drive letter is arguably nicer
 than the Linux mountpoint story. Two viable routes:
@@ -333,13 +337,13 @@ than the Linux mountpoint story. Two viable routes:
 
 Closer to Linux than Windows is:
 
-| Linux piece | macOS equivalent |
-|---|---|
-| systemd user unit | `launchd` user agent (`~/Library/LaunchAgents/*.plist`, `RunAtLoad`, `KeepAlive`) |
-| FUSE | [macFUSE](https://macfuse.github.io), or rclone's NFS mount to avoid a kernel extension |
-| `notify-send` | `osascript -e 'display notification …'`, or `terminal-notifier` |
-| `flock` | works as-is (`fcntl.flock` is POSIX) |
-| `journalctl` | `log show`, or the rotating log file |
+| Linux piece       | macOS equivalent                                                                        |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| systemd user unit | `launchd` user agent (`~/Library/LaunchAgents/*.plist`, `RunAtLoad`, `KeepAlive`)       |
+| FUSE              | [macFUSE](https://macfuse.github.io), or rclone's NFS mount to avoid a kernel extension |
+| `notify-send`     | `osascript -e 'display notification …'`, or `terminal-notifier`                         |
+| `flock`           | works as-is (`fcntl.flock` is POSIX)                                                    |
+| `journalctl`      | `log show`, or the rotating log file                                                    |
 
 `flock`, `watchdog` and the whole Python layer need no changes. A `launchd`
 agent replacing `cloud-sync.service` plus one per mount, and a two-line change in

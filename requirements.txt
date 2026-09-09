@@ -1,0 +1,12 @@
+# Runtime dependency of bin/cloud-sync.
+#
+# Prefer your distribution's package so it upgrades with the system python:
+#   Arch          pacman -S python-watchdog
+#   Debian/Ubuntu apt install python3-watchdog
+#   Fedora        dnf install python3-watchdog
+#
+# Otherwise:  pip install --user -r requirements.txt
+#
+# Everything else the script needs is in the standard library (tomllib requires
+# Python 3.11 or newer).
+watchdog>=2.1
