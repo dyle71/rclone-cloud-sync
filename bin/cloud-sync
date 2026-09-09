@@ -1133,6 +1133,39 @@ def record_run(pair: Pair, result: str, reason: str, rc: int = 0, changed: int =
         _status_save(data)
 
 
+# Kept open for the lifetime of the process: closing it would drop the lock.
+_daemon_lock_fh = None
+
+
+def acquire_daemon_lock() -> None:
+    """
+    Take the daemon's exclusive lock, or exit because one is already running.
+
+    Two daemons would each watch the same directories, each poll the same
+    remotes, and each record themselves as *the* daemon in status.json - so
+    whichever started last would make the other invisible to --status while both
+    kept syncing.  The handle stays open on purpose; the kernel releases the lock
+    when the process dies, so it can never go stale.
+    """
+    global _daemon_lock_fh
+    lock_path = STATUS_FILE.parent / "daemon.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0)
+        holder = fh.read().strip() or "unknown"
+        fh.close()
+        sys.exit(f"cloud-sync: a daemon is already running ({holder}).\n"
+                 f"Check it with: systemctl --user status {DAEMON_UNIT}")
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"pid={os.getpid()}\n")
+    fh.flush()
+    _daemon_lock_fh = fh
+
+
 def record_mount(m: Mount, state: str) -> None:
     """Remember the outcome of one mount health check."""
     now = time.time()
@@ -1152,17 +1185,67 @@ def record_daemon(running: bool) -> None:
         _status_save(data)
 
 
-def _daemon_alive(info: dict) -> bool:
-    pid = int(info.get("pid") or 0)
-    if not pid:
-        return False
+DAEMON_UNIT = "cloud-sync.service"
+
+
+def _pid_is_daemon(pid: int) -> bool:
+    """
+    Is `pid` really one of our daemons, rather than a recycled PID?
+
+    "Does this PID exist" is not enough: PIDs get reused, so a number recorded
+    hours ago may by now belong to anything at all.  The command line settles it.
+    """
     try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError):
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
         return False
-    except PermissionError:
-        return True
+    return b"cloud-sync" in cmdline
+
+
+def _proc_start_time(pid: int) -> "float | None":
+    """Wall-clock start time of `pid`, from /proc/<pid>/stat plus the boot time."""
+    try:
+        # Field 22 (1-based) of /proc/<pid>/stat, counted after the ")" that ends
+        # the comm field - the comm itself may contain spaces or parentheses.
+        after_comm = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1]
+        starttime_ticks = int(after_comm.split()[19])
+        ticks = os.sysconf("SC_CLK_TCK")
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return int(line.split()[1]) + starttime_ticks / ticks
+    except Exception:
+        return None
+    return None
+
+
+def daemon_state(info: dict) -> "tuple[bool, int | None, float | None]":
+    """
+    Is a daemon running, and which one?  Returns (running, pid, started).
+
+    systemd is asked first: for the unit we ship it is authoritative, and it
+    stays correct even when the recorded state is stale or was overwritten by
+    another invocation.  The recorded PID is the fallback, for anyone running the
+    daemon by hand.
+    """
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", DAEMON_UNIT,
+                            "-p", "ActiveState", "-p", "MainPID", "--value"],
+                           capture_output=True, text=True, timeout=5)
+        fields = (r.stdout or "").split()
+        if r.returncode == 0 and len(fields) >= 2 and fields[0] == "active":
+            pid = int(fields[1] or 0)
+            if pid and _pid_is_daemon(pid):
+                # Use the recorded start time only if it describes this process.
+                started = info.get("started") if int(info.get("pid") or 0) == pid \
+                    else _proc_start_time(pid)
+                return True, pid, started
+    except Exception:
+        pass   # no systemd here, or not run as a unit - fall back to the record
+
+    pid = int(info.get("pid") or 0)
+    if pid and _pid_is_daemon(pid):
+        return True, pid, info.get("started")
+    return False, None, None
 
 
 def _ago(ts) -> str:
@@ -1295,12 +1378,12 @@ def print_status(as_json: bool = False) -> int:
     """Instant, offline overview.  Exit code 0 = everything healthy."""
     data = _status_load()
     daemon = data.get("daemon") or {}
-    alive = _daemon_alive(daemon)
+    alive, daemon_pid, daemon_started = daemon_state(daemon)
     healthy = True
     connected = online()
     report = {"config": str(CFG.source),
-              "daemon": {"running": alive, "pid": daemon.get("pid"),
-                         "started": _stamp(daemon.get("started")) if alive else None},
+              "daemon": {"running": alive, "pid": daemon_pid,
+                         "started": _stamp(daemon_started) if alive else None},
               "online": connected,
               "probe": f"{CFG.probe_host}:{CFG.probe_port}",
               "pairs": [], "mounts": []}
@@ -1357,10 +1440,11 @@ def print_status(as_json: bool = False) -> int:
 
     print(f"{label('Configuration')}{c(str(CFG.source), 'grey')}")
     if alive:
-        pid = daemon.get("pid")
-        started = _stamp(daemon.get("started"))
-        uptime = _ago(daemon.get("started"))
-        detail = c(f"PID {pid}, up since {started} ({uptime})", "grey")
+        if daemon_started:
+            detail = c(f"PID {daemon_pid}, up since {_stamp(daemon_started)} "
+                       f"({_ago(daemon_started)})", "grey")
+        else:
+            detail = c(f"PID {daemon_pid}", "grey")
         print(f"{label('Daemon')}✅ {c('running', 'green', 'bold')}  {detail}")
     else:
         print(f"{label('Daemon')}❌ {c('NOT running', 'red', 'bold')}  "
@@ -1639,6 +1723,9 @@ def main():
         sys.exit(0 if outcome in _BENIGN_RESULTS else 1)
 
     # ── Daemon mode ──────────────────────────────────────────────────────────
+    # Exits here if another daemon already holds the lock.
+    acquire_daemon_lock()
+
     log.info("Starting cloud sync daemon (%d pairs, %d mounts, config: %s)",
              len(CFG.pairs), len(CFG.mounts), CFG.source)
     for p in CFG.pairs:

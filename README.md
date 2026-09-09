@@ -296,6 +296,14 @@ looking like it waits for the network. Mounts instead fail fast
 (`TimeoutStartSec`) and are retried; the daemon probes connectivity itself and
 backs off while offline.
 
+**The daemon's identity is not just a PID.** `--status` used to trust the PID
+recorded in `status.json`, which fails in both directions: PIDs get reused, so a
+stale number can point at an unrelated process, and any hand-started daemon
+overwrote the record and made the real one look dead. It now asks systemd first
+and verifies the PID against `/proc/<pid>/cmdline`. A second daemon is refused
+outright by an flock, since two of them would watch the same directories and
+each claim to be *the* daemon.
+
 **A mount is checked by reading it, not by `ismount()`.** The common failure is
 a mount that is still "mounted" but hangs on every I/O. That needs a real read
 with a timeout, done in a throwaway thread so a hung FUSE mount cannot block the
