@@ -122,7 +122,7 @@ the site when asked. rclone's
 ### 2. Install
 
 ```bash
-git clone https://github.com/<you>/rclone-cloud-sync.git
+git clone https://github.com/dyle71/rclone-cloud-sync.git
 cd rclone-cloud-sync
 ./install.sh          # writes a starter config on the first run
 ```
