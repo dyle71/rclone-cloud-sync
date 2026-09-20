@@ -56,6 +56,13 @@ mount_poll = 60
 # does not notify you every minute.
 notify_repeat = 21600
 
+# Seconds a file written to a [[mount]] may sit in the local VFS cache before
+# --status calls the upload queue stuck (📤 UPLOADS STUCK).  A file that was
+# just saved is legitimately unuploaded for a while; one that still is after
+# this long is not on its way anywhere.  Raise it on a slow uplink or if you
+# routinely write files larger than the line can push in 15 minutes.
+vfs_stuck_after = 900
+
 # host:port for the cheap "is the cloud reachable at all" probe.  Point it at
 # your provider: graph.microsoft.com for OneDrive/SharePoint, or use
 # cloudflare.com for a generic reachability check.
@@ -122,10 +129,20 @@ mountpoint = "~/Documents/Cloud/work/Team"
 # stable if you ever rename the mount.
 # instance = "team-docs"
 
-# `mount_opts` replaces the built-in defaults entirely, so repeat what you still
-# want.  The defaults are:
+# `extra_mount_opts` is ADDED to the built-in defaults - use this to add a flag
+# without having to restate the rest.  The defaults are:
 #     --vfs-cache-mode writes --vfs-cache-max-age 24h --vfs-cache-max-size 20G
 #     --dir-cache-time 1h --poll-interval 1m --vfs-fast-fingerprint --no-modtime
+#
+# A SharePoint document library rewrites .docx/.xlsx/.pptx files server-side on
+# upload, so the stored object is bigger than what was sent and rclone's
+# post-copy size and hash checks can never succeed - it calls the transfer
+# corrupt and retries forever, while the only copy of your file stays in the
+# local cache.  These two flags are the workaround:
+# extra_mount_opts = ["--ignore-size", "--ignore-checksum"]
+
+# `mount_opts` REPLACES the built-in defaults entirely, so repeat what you still
+# want.  Setting both mount_opts and extra_mount_opts is an error.
 # mount_opts = [
 #     "--vfs-cache-mode", "full",     # cache reads too - faster re-reads, more disk
 #     "--dir-cache-time", "30m",

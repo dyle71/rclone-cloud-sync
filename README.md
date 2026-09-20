@@ -209,6 +209,99 @@ systemctl --user enable --now rclone-mount@team-documents.service
 systemctl --user start cloud-sync.service
 ```
 
+## When uploads get stuck
+
+A `[[mount]]` accepts a write instantly and uploads it afterwards. Until that
+upload succeeds, the only copy of the file is the blob in
+`~/.cache/rclone/vfs/`. If the upload can never succeed, the mount keeps
+looking perfectly healthy while nothing you save actually reaches the cloud.
+
+**SharePoint document libraries do exactly that to Office files.** They rewrite
+`.docx`, `.xlsx` and `.pptx` server-side on upload, injecting their own
+metadata, so the stored object is a few kilobytes larger than what was sent.
+rclone's post-copy size check fails, it calls the transfer corrupt, deletes the
+destination copy and retries — forever. Plain files (`.md`, `.pdf`, …) are
+unaffected.
+
+### Spotting it
+
+```bash
+cloud-sync --status                      # 📤 UPLOADS STUCK, with the file list
+systemctl --user show -p StatusText rclone-mount@<instance>.service
+# StatusText=…vfs cache: objects 5 (was 5) in use 5, to upload 5, uploading 0…
+journalctl --user -u rclone-mount@<instance>.service | grep -i 'corrupted on transfer'
+```
+
+`--status` reads the cache metadata only — no network, no FUSE traffic — and
+exits non-zero as soon as a file has been waiting longer than `vfs_stuck_after`
+(15 min by default). A file that was just saved is *supposed* to be unuploaded
+for a moment; that is what the threshold is for.
+
+### The fix
+
+Turn off the two checks SharePoint breaks:
+
+```toml
+[[mount]]
+name             = "Team Documents"
+remote           = "sharepoint-team:"
+mountpoint       = "~/Documents/Cloud/work/Team"
+# SharePoint rewrites Office files on upload; without these the post-copy
+# size and hash checks can never succeed.
+extra_mount_opts = ["--ignore-size", "--ignore-checksum"]
+```
+
+`extra_mount_opts` is **added** to the built-in defaults; `mount_opts`
+**replaces** them. Setting both is a config error.
+
+`--ignore-checksum` is needed alongside `--ignore-size` because SharePoint
+recomputes the QuickXorHash over the rewritten file, so the hash mismatches for
+the same reason the size does.
+
+### Recovering the files already stuck
+
+Changing the flags does not rescue what is already in the queue: rclone keeps
+retrying the *cached* copy, and for some failure modes (`404 itemNotFound —
+the upload session was not found`) it never recovers at all. The cached copy is
+the newest version of the file, so get it out before touching anything.
+
+```bash
+# 1. find them - the paths --status prints are relative to the cache root
+cloud-sync --status
+CACHE=~/.cache/rclone/vfs/"<remote name>"
+
+# 2. copy them somewhere safe FIRST, while the mount is still up
+cp -a "$CACHE/<path>/Report.docx" ~/rescue/
+
+# 3. stop the mount, apply the flags, start it again
+systemctl --user stop rclone-mount@<instance>.service
+$EDITOR ~/.config/cloud-sync/config.toml     # add extra_mount_opts
+cloud-sync --export-mount-units
+systemctl --user start rclone-mount@<instance>.service
+
+# 4. write the rescued file back through the mount and confirm it lands
+cp ~/rescue/Report.docx ~/Documents/Cloud/work/Team/<path>/
+cloud-sync --status                           # ✅ nothing waiting
+```
+
+Step 4 is the verification: the entry only goes `"Dirty": false` in
+`~/.cache/rclone/vfsMeta/…` once the upload was accepted.
+
+### Orphaned cache roots
+
+Renaming a remote leaves its cache subtree behind under a name nothing points
+at any more. Unuploaded files in there are retried by nobody and shown by
+nothing — so `--status` scans for them and reports them as `🚨 UNREACHABLE
+DATA`:
+
+```bash
+cloud-sync --status
+cp -a ~/.cache/rclone/vfs/"Team - X"/<path> ~/rescue/   # rescue first
+rm -rf ~/.cache/rclone/vfs/"Team - X" ~/.cache/rclone/vfsMeta/"Team - X"
+```
+
+Copy anything you still want back in through the current mount afterwards.
+
 ## Units
 
 | Unit                         | Role                                                                                         |
@@ -242,6 +335,8 @@ at logout, so a fresh session is allowed to warn you once again.
 | `🔄 SETTINGS OUTDATED` | config changed without re-export: `cloud-sync --export-mount-units`, then restart the unit                                                                  |
 | `🧟 STALE` (mount)     | the mount hangs: `systemctl --user restart rclone-mount@<instance>.service`                                                                                 |
 | `🚨 HIDDEN FILES`      | **data at risk**: something wrote into an unmounted mountpoint. Those files vanish from view once it mounts. Move them out, empty the directory, then mount |
+| `📤 UPLOADS STUCK`     | **data at risk**: files written to the mount never reached the cloud and exist only in the local cache. See [When uploads get stuck](#when-uploads-get-stuck) |
+| `🚨 UNREACHABLE DATA`  | **data at risk**: a cache root left behind by a renamed remote still holds unuploaded files, and no mount will ever retry them. See [Orphaned cache roots](#orphaned-cache-roots) |
 | `token expired`        | `rclone config reconnect <remote>:`                                                                                                                         |
 
 Conflicts are resolved with `--conflict-resolve newer`; the losing version is
@@ -259,6 +354,7 @@ Logs: `journalctl --user -u cloud-sync -f` or
 | `~/.local/state/cloud-sync/status.json`         | last run per pair, mount states (survives reboots) |
 | `$XDG_RUNTIME_DIR/cloud-sync/notify-state.json` | notification state (ephemeral)                     |
 | `~/.cache/rclone/bisync/`                       | bisync baselines and locks                         |
+| `~/.cache/rclone/vfs/`, `vfsMeta/`              | mount cache: file blobs and their upload state (read by `--status`, never written) |
 | `~/.local/share/rclone/cloud-sync.log`          | rotating log, 5 MB × 3                             |
 
 `./uninstall.sh` removes the units and unmounts everything, and touches none of
@@ -303,6 +399,15 @@ overwrote the record and made the real one look dead. It now asks systemd first
 and verifies the PID against `/proc/<pid>/cmdline`. A second daemon is refused
 outright by an flock, since two of them would watch the same directories and
 each claim to be *the* daemon.
+
+**A healthy mount is not the same as a mount that uploads.** Every check we
+had — mounted, readable, unit active, settings current — passed on a mount that
+had not uploaded a single Office file in a week; the files sat in the VFS cache
+and `--status` said `✅ OK`. The upload queue is now part of the health check,
+read from the cache metadata rather than from rclone: it costs no network, it
+works while the remote is unreachable, and it cannot be blocked by the hung
+mount it is reporting on. Age is what separates a stuck queue from a file that
+is simply still on its way up, hence `vfs_stuck_after`.
 
 **A mount is checked by reading it, not by `ismount()`.** The common failure is
 a mount that is still "mounted" but hangs on every I/O. That needs a real read

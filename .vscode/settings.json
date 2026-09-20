@@ -9,11 +9,13 @@
     "allstates",
     "bisync",
     "deletefile",
+    "docx",
     "fcntl",
     "fusermount",
     "getpid",
     "inotify",
     "ismount",
+    "isoformat",
     "journalctl",
     "killable",
     "listremotes",
@@ -27,6 +29,7 @@
     "oneshot",
     "osascript",
     "pacman",
+    "pptx",
     "pycache",
     "rclone",
     "Referer",
@@ -37,8 +40,12 @@
     "tomllib",
     "ucolor",
     "uninit",
+    "unuploaded",
     "ustate",
+    "vfs",
     "volname",
-    "watchdog"
+    "watchdog",
+    "xlsx",
+    "Xor"
   ]
 }

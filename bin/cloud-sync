@@ -34,9 +34,9 @@ Modes:
   --list        Print the configured pairs and mounts with their state, then exit.
   --status      Health report: connectivity, baseline age, outcome of the last
                 run per pair, failures since the last success, the local files
-                modified since the baseline (i.e. not yet synced) and the state
-                of every mount.  Exit code 0 only if everything is healthy and
-                nothing is pending.
+                modified since the baseline (i.e. not yet synced), the state of
+                every mount and the files a mount has not managed to upload.
+                Exit code 0 only if everything is healthy and nothing is pending.
   --diff        Live per-file comparison against the remote via 'rclone check'
                 (--quick = size only, --pair NAME = one pair, --limit N = cap
                 the printed paths).  Exit code 0 only if everything matches.
@@ -53,6 +53,10 @@ Design notes / intentional behavior:
   * Notifications are edge-triggered: one message per state change, a persisting
     problem re-announced at most once per notify_repeat, and at most one entry
     per topic in the notification centre.
+  * A [[mount]] is only healthy if it also UPLOADS.  Mounted, readable and
+    active says nothing about the VFS write-back queue, which can be stuck
+    forever while every other check passes - so --status reads the cache
+    metadata and reports what never made it to the cloud.
 """
 
 import argparse
@@ -71,6 +75,7 @@ import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -92,6 +97,10 @@ DEFAULT_SETTINGS = {
     "mount_poll": 60,
     # A problem that persists is re-announced at most once per this interval.
     "notify_repeat": 6 * 3600,
+    # Seconds a file may sit in the mount's VFS cache unuploaded before the
+    # upload queue counts as stuck.  Below that a dirty entry is just a file
+    # that is still on its way up.
+    "vfs_stuck_after": 900,
     # host:port used for the cheap "is there internet at all" probe
     "probe_host":    "graph.microsoft.com",
     "probe_port":    443,
@@ -216,6 +225,7 @@ class Config:
     token_refresh:    int
     mount_poll:       int
     notify_repeat:    int
+    vfs_stuck_after:  int
     probe_host:       str
     probe_port:       int
     log_max_bytes:    int
@@ -299,10 +309,22 @@ def load_config(path: Path) -> Config:
         # working; everything else runs on the shared template.
         unit = str(entry["unit"]) if entry.get("unit") else \
             MOUNT_UNIT_TEMPLATE.format(instance=instance)
+        # mount_opts replaces the defaults, extra_mount_opts appends to them.
+        # Both at once has no sensible meaning - one of them would silently do
+        # nothing - so it is rejected instead of given a precedence rule.
+        if "mount_opts" in entry and "extra_mount_opts" in entry:
+            sys.exit(f"cloud-sync: [[mount]] '{entry['name']}' sets both 'mount_opts' and "
+                     f"'extra_mount_opts'.\n"
+                     f"  mount_opts replaces the built-in defaults, extra_mount_opts appends "
+                     f"to them - use one or the other.")
+        if "mount_opts" in entry:
+            opts = [str(o) for o in entry["mount_opts"]]
+        else:
+            opts = list(DEFAULT_MOUNT_OPTS) + [str(o) for o in entry.get("extra_mount_opts", [])]
         mount = Mount(name=str(entry["name"]), remote=str(entry["remote"]),
                       mountpoint=_expand(entry["mountpoint"]),
                       instance=instance,
-                      opts=[str(o) for o in entry.get("mount_opts", DEFAULT_MOUNT_OPTS)],
+                      opts=opts,
                       unit=unit)
         mp = str(mount.mountpoint)
         if mp in seen_mp:
@@ -331,6 +353,7 @@ def load_config(path: Path) -> Config:
         token_refresh=int(settings["token_refresh"]),
         mount_poll=int(settings["mount_poll"]),
         notify_repeat=int(settings["notify_repeat"]),
+        vfs_stuck_after=int(settings["vfs_stuck_after"]),
         probe_host=str(settings["probe_host"]),
         probe_port=int(settings["probe_port"]),
         log_max_bytes=int(settings["log_max_bytes"]),
@@ -758,6 +781,163 @@ def do_bisync(pair: Pair, reason: str = "manual", resync: bool = False) -> str:
         return RESULT_OK
 
 
+# ── VFS upload backlog ────────────────────────────────────────────────────────
+#
+# A [[mount]] with --vfs-cache-mode writes accepts a write instantly and uploads
+# it afterwards.  Until that upload succeeds the only copy of the file is the
+# blob in the local cache, and rclone records that in a JSON sidecar next to it:
+#
+#   ~/.cache/rclone/vfsMeta/<remote>/<path>   {"ModTime": …, "Size": …,
+#                                              "Dirty": true}
+#
+# "Dirty": true is the normal state of a file that was just saved.  It is also
+# the permanent state of a file whose upload can never succeed - SharePoint
+# document libraries rewrite Office files server-side, so rclone's post-copy
+# size check fails and it retries forever.  Age is what tells the two apart.
+#
+# Reading the sidecars is the only way to see that backlog without asking the
+# mount anything: no FUSE traffic, no network, and it works while the remote is
+# unreachable - which is exactly when the backlog grows.
+
+# Pending paths collected for the report.  Counting continues past the cap - a
+# cache with ten thousand stuck files must still say ten thousand - only the
+# path list stops growing, so neither the walk nor the output explodes.
+_VFS_SAMPLE_CAP = 20
+
+_VFS_TIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _vfs_meta_dir(opts: "list[str]") -> Path:
+    """
+    The vfsMeta directory the given 'rclone mount' flags write into.
+
+    --cache-dir on the mount wins, then $RCLONE_CACHE_DIR, then rclone's own
+    default of ~/.cache/rclone.
+    """
+    cache_dir = None
+    for i, opt in enumerate(opts):
+        if opt == "--cache-dir" and i + 1 < len(opts):
+            cache_dir = opts[i + 1]
+        elif opt.startswith("--cache-dir="):
+            cache_dir = opt.split("=", 1)[1]
+    if not cache_dir:
+        cache_dir = os.environ.get("RCLONE_CACHE_DIR") or "~/.cache/rclone"
+    return _expand(cache_dir) / "vfsMeta"
+
+
+def _remote_cache_path(remote: str) -> str:
+    """
+    "Team Share:"          -> "Team Share"
+    "sharepoint:Projects"  -> "sharepoint/Projects"
+
+    rclone drops the colon and keeps the remote's root path below the remote
+    name, so a mount of a subdirectory has its own subtree in the cache.
+    """
+    name, _, path = remote.partition(":")
+    return "/".join([name.strip("/")] + [p for p in path.split("/") if p])
+
+
+def vfs_cache_root(m: Mount) -> Path:
+    """
+    Where rclone keeps this mount's VFS metadata.
+
+    Derived from the configured remote, never from whatever happens to sit in
+    the cache directory: a subtree in there may belong to a remote that no
+    longer exists (see orphan_cache_roots()).
+    """
+    return _vfs_meta_dir(m.opts) / _remote_cache_path(m.remote)
+
+
+def _vfs_modtime(value) -> "float | None":
+    """RFC-3339 as rclone writes it (nanosecond precision) -> epoch seconds."""
+    match = _VFS_TIME_RE.match(str(value).strip())
+    if not match:
+        return None
+    base, frac, zone = match.groups()
+    # datetime.fromisoformat takes 3 or 6 fractional digits, rclone writes 9.
+    text = base + (frac[:7] if frac else "") + (zone or "+00:00").replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def vfs_backlog(root: Path, min_age: float, now: "float | None" = None) -> dict:
+    """
+    The unuploaded files under one VFS metadata root, older than `min_age`.
+
+    Purely local: it reads JSON sidecars, never the cached blobs and never the
+    mount.  Entries younger than min_age are skipped - those are files that are
+    legitimately still on their way up.
+    """
+    now = time.time() if now is None else now
+    found = {"root": str(root), "count": 0, "bytes": 0, "oldest": 0.0,
+             "sample": [], "truncated": False}
+    if not root.is_dir():
+        return found
+
+    for dirpath, _dirs, files in os.walk(root, onerror=lambda _e: None):
+        for name in files:
+            full = os.path.join(dirpath, name)
+            try:
+                with open(full, "rb") as fh:
+                    meta = json.load(fh)
+            except Exception:
+                continue   # not a sidecar, or being rewritten right now
+            if not meta.get("Dirty"):
+                continue
+            ts = _vfs_modtime(meta.get("ModTime"))
+            if ts is None:
+                with contextlib.suppress(OSError):
+                    ts = os.stat(full).st_mtime
+            age = now - ts if ts else 0.0
+            if age < min_age:
+                continue
+            found["count"] += 1
+            found["bytes"] += int(meta.get("Size") or 0)
+            found["oldest"] = max(found["oldest"], age)
+            if len(found["sample"]) < _VFS_SAMPLE_CAP:
+                found["sample"].append(os.path.relpath(full, root))
+            else:
+                found["truncated"] = True
+    return found
+
+
+def orphan_cache_roots() -> "list[dict]":
+    """
+    VFS cache subtrees holding unuploaded files that no [[mount]] claims.
+
+    Renaming a remote leaves its old cache subtree behind.  Nothing points at it
+    any more, so nothing will ever retry those uploads: the newest version of
+    those files exists only there, and no other part of this tool would ever
+    mention them.  Only roots that actually hold dirty data are reported - a
+    stale but fully uploaded subtree is just wasted disk.
+    """
+    # The default cache directory is scanned even when no mount uses it: data
+    # left behind by a mount that was removed from the config lives there too.
+    claimed: "dict[Path, set[str]]" = {_vfs_meta_dir([]): set()}
+    for m in CFG.mounts:
+        meta = _vfs_meta_dir(m.opts)
+        # The first path segment is what a top-level scan sees: a mount of
+        # "remote:sub" still claims the whole "remote" subtree.
+        claimed.setdefault(meta, set()).add(_remote_cache_path(m.remote).split("/")[0])
+
+    orphans = []
+    for meta, names in claimed.items():
+        try:
+            entries = sorted(p for p in meta.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name in names:
+                continue
+            # No mount retries these, so every dirty entry counts regardless of age.
+            backlog = vfs_backlog(entry, min_age=0.0)
+            if backlog["count"]:
+                orphans.append({"name": entry.name, **backlog})
+    return orphans
+
+
 # ── Mount health ──────────────────────────────────────────────────────────────
 #
 # A FUSE mount fails in more ways than "is it mounted".  In rough order of how
@@ -773,9 +953,14 @@ def do_bisync(pair: Pair, reason: str = "manual", resync: bool = False) -> str:
 #              wrote into the mountpoint while the mount was gone: those files
 #              are invisible once it is mounted again, and are lost on a cleanup.
 #              The one state that can cost data, hence reported as critical.
+#   upload-stuck  mounted and answering, but files written to it are sitting in
+#              the local VFS cache unuploaded.  Reads and writes work, so every
+#              other check is happy while the cloud copy silently falls behind.
+#              The other state that can cost data.
 
 MOUNT_OK, MOUNT_STALE, MOUNT_UNMOUNTED = "ok", "stale", "unmounted"
 MOUNT_UNIT_FAILED, MOUNT_SHADOWED = "unit-failed", "shadowed"
+MOUNT_UPLOAD_STUCK = "upload-stuck"
 # Mounted and fine, but its EnvironmentFile no longer matches the config: the
 # running mount uses stale settings until --export-mount-units and a restart.
 MOUNT_OUTDATED = "unit-outdated"
@@ -785,6 +970,7 @@ _MOUNT_PROBE_TIMEOUT = 3.0
 # Last state logged per mount, so a persisting problem is logged once rather
 # than on every poll.  Notifications have their own, persistent state file.
 _last_mount_state: "dict[str, str]" = {}
+_last_orphan_count = -1
 
 
 def _unit_active_state(unit: str) -> str:
@@ -831,7 +1017,9 @@ def _dir_has_entries(path: Path) -> bool:
 def mount_health(m: Mount) -> dict:
     """Current state of one mount, cheapest check first."""
     info = {"name": m.name, "remote": m.remote, "mountpoint": str(m.mountpoint),
-            "unit": m.unit, "unit_state": None, "state": MOUNT_OK}
+            "unit": m.unit, "unit_state": None, "state": MOUNT_OK,
+            "pending_uploads": 0, "pending_bytes": 0, "oldest_pending": None,
+            "pending_sample": [], "cache_root": str(vfs_cache_root(m))}
 
     if m.unit:
         info["unit_state"] = _unit_active_state(m.unit)
@@ -848,9 +1036,20 @@ def mount_health(m: Mount) -> dict:
         info["state"] = MOUNT_STALE
         return info
 
-    # Mounted and readable.  A failed unit on top of that is still worth saying.
+    # Mounted and readable, so the upload queue can be judged: a backlog here
+    # means files that exist only locally, not a mount that is unusable.  It is
+    # checked last on purpose - it must never mask STALE or UNMOUNTED.
+    backlog = vfs_backlog(vfs_cache_root(m), min_age=CFG.vfs_stuck_after)
+    info.update(pending_uploads=backlog["count"], pending_bytes=backlog["bytes"],
+                oldest_pending=int(backlog["oldest"]) or None,
+                pending_sample=backlog["sample"])
+
+    # A failed unit on top of that is still worth saying, and outranks a
+    # backlog: the backlog is a consequence once the mount itself is broken.
     if info["unit_state"] == "failed":
         info["state"] = MOUNT_UNIT_FAILED
+    elif backlog["count"]:
+        info["state"] = MOUNT_UPLOAD_STUCK
     elif not env_file_current(m):
         info["state"] = MOUNT_OUTDATED
     return info
@@ -866,6 +1065,9 @@ _MOUNT_MESSAGE = {
     MOUNT_SHADOWED:    ("Warning: hidden local files",
                         "is NOT mounted but its directory holds local files.\n"
                         "They become invisible as soon as the drive is mounted again."),
+    MOUNT_UPLOAD_STUCK: ("Warning: uploads are not going through",
+                         "cannot upload what was written to it.\n"
+                         "Those files exist only in the local cache."),
 }
 
 
@@ -888,6 +1090,10 @@ def check_mount(m: Mount, offline: "bool | None" = None) -> str:
 
     summary, detail = _MOUNT_MESSAGE[state]
     body = f"{m.name} {detail}"
+    if state == MOUNT_UPLOAD_STUCK:
+        body += (f"\n{info['pending_uploads']} file(s), "
+                 f"{_human_bytes(info['pending_bytes'])}, oldest "
+                 f"{_duration(info['oldest_pending'])}")
     if m.unit:
         body += f"\nsystemctl --user status {m.unit}"
     # Warn on the transition, then keep quiet: a mount that stays down for a day
@@ -908,8 +1114,36 @@ def check_mounts() -> str:
         return MOUNT_OK
     offline = not online()
     states = [check_mount(m, offline=offline) for m in CFG.mounts]
+    check_orphan_caches()
     bad = [s for s in states if s != MOUNT_OK]
     return bad[0] if bad else MOUNT_OK
+
+
+def check_orphan_caches() -> "list[dict]":
+    """
+    Announce cache subtrees with unuploaded files that no mount claims.
+
+    Edge-triggered like every other notification: the message changes only when
+    the number of unreachable files does, so a backlog nobody cleans up is
+    mentioned once (and again per notify_repeat), not on every poll.
+    """
+    global _last_orphan_count
+    orphans = orphan_cache_roots()
+    if not orphans:
+        _last_orphan_count = 0
+        notify_ok("vfs-orphan", "Cloud sync - orphaned cache cleared", "")
+        return orphans
+    total = sum(o["count"] for o in orphans)
+    names = ", ".join(o["name"] for o in orphans[:3])
+    # Same rule as the mount states: say it when it changes, not every poll.
+    log.log(logging.DEBUG if _last_orphan_count == total else logging.WARNING,
+            "Orphaned VFS cache: %d unuploaded file(s) under %s", total, names)
+    _last_orphan_count = total
+    notify_state("vfs-orphan", f"orphan:{total}", "Warning: unreachable local files",
+                 f"{total} file(s) were never uploaded and no mount points at them "
+                 f"any more.\n{names}\ncloud-sync --status",
+                 urgency="critical", icon="dialog-error")
+    return orphans
 
 
 def env_file_current(m: Mount) -> bool:
@@ -1263,6 +1497,29 @@ def _ago(ts) -> str:
     return f"{delta // 86400}d {(delta % 86400) // 3600}h ago"
 
 
+def _duration(seconds) -> str:
+    """A number of seconds as a human span: 45s, 12min, 3h 20min, 7d 4h."""
+    if not seconds:
+        return "0s"
+    delta = int(seconds)
+    if delta < 60:
+        return f"{delta}s"
+    if delta < 3600:
+        return f"{delta // 60}min"
+    if delta < 86400:
+        return f"{delta // 3600}h {(delta % 3600) // 60}min"
+    return f"{delta // 86400}d {(delta % 86400) // 3600}h"
+
+
+def _human_bytes(num) -> str:
+    size = float(num or 0)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
 def _stamp(ts) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts))) if ts else "-"
 
@@ -1366,6 +1623,7 @@ _MOUNT_STYLE = {
     MOUNT_UNIT_FAILED: ("❌", "UNIT FAILED",      "red"),
     MOUNT_OUTDATED:    ("🔄", "SETTINGS OUTDATED", "yellow"),
     MOUNT_SHADOWED:    ("🚨", "HIDDEN FILES",     "magenta"),
+    MOUNT_UPLOAD_STUCK: ("📤", "UPLOADS STUCK",    "magenta"),
 }
 
 
@@ -1386,7 +1644,7 @@ def print_status(as_json: bool = False) -> int:
                          "started": _stamp(daemon_started) if alive else None},
               "online": connected,
               "probe": f"{CFG.probe_host}:{CFG.probe_port}",
-              "pairs": [], "mounts": []}
+              "pairs": [], "mounts": [], "orphan_caches": []}
     if not alive:
         healthy = False
 
@@ -1433,6 +1691,12 @@ def print_status(as_json: bool = False) -> int:
             "last_ok": _stamp(remembered.get("last_ok")),
             "last_ok_ago": _ago(remembered.get("last_ok")),
         })
+
+    # Cache subtrees nobody mounts any more: unreachable local-only data, the
+    # same class of problem as MOUNT_SHADOWED and just as invisible otherwise.
+    report["orphan_caches"] = orphan_cache_roots()
+    if report["orphan_caches"]:
+        healthy = False
 
     if as_json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -1513,6 +1777,33 @@ def print_status(as_json: bool = False) -> int:
                 elif m["state"] == MOUNT_OUTDATED:
                     print(f"  {label('Fix')}{c('cloud-sync --export-mount-units', 'bold')}"
                           f"{c(', then systemctl --user restart ' + m['unit'], 'grey')}")
+            if m["pending_uploads"]:
+                print(f"  {label('Uploads')}📤 {c(str(m['pending_uploads']) + ' file(s)', 'magenta', 'bold')} "
+                      f"waiting {c('(' + _human_bytes(m['pending_bytes']) + ', oldest '
+                                   + _duration(m['oldest_pending']) + ')', 'grey')}")
+                for path in m["pending_sample"][:5]:
+                    print(f"  {label('')}{c('· ' + path, 'grey')}")
+                if m["pending_uploads"] > 5:
+                    print(f"  {label('')}{c('… and ' + str(m['pending_uploads'] - 5) + ' more', 'grey')}")
+                print(f"  {label('')}{c('they exist only in ' + m['cache_root'], 'magenta')}")
+            elif m["state"] == MOUNT_OK:
+                print(f"  {label('Uploads')}✅ {c('nothing waiting', 'green')}")
+
+    if report["orphan_caches"]:
+        print()
+        print(rule("🗃️ Orphaned cache"))
+        for o in report["orphan_caches"]:
+            print()
+            print(f"{c(o['name'], 'bold', 'blue')}  🚨 {c('UNREACHABLE DATA', 'magenta', 'bold')}")
+            print(f"  {c(o['root'], 'grey')}")
+            print(f"  {label('Unuploaded')}{o['count']} file(s), {_human_bytes(o['bytes'])}, "
+                  f"oldest {_duration(o['oldest'])}")
+            for path in o["sample"][:5]:
+                print(f"  {label('')}{c('· ' + path, 'grey')}")
+            if o["count"] > 5:
+                print(f"  {label('')}{c('… and ' + str(o['count'] - 5) + ' more', 'grey')}")
+            print(f"  {label('')}{c('no [[mount]] points here, so nothing will ever upload them', 'magenta')}")
+            print(f"  {label('Fix')}{c('copy them out of the cache, then delete the directory', 'grey')}")
 
     print()
     print(c("Details: cloud-sync --diff   (real comparison against the cloud)", "grey"))
