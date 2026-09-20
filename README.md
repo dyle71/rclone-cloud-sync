@@ -8,6 +8,35 @@ status command that tells you the truth about all of it.
 > ideas behind it port to Windows and macOS without much trouble; see
 > [Other platforms](#other-platforms). The code as shipped does not.
 
+> [!WARNING]
+> **⚠️ SharePoint silently eats your Office files**
+>
+> **If you mount a SharePoint document library (`drive_type =
+> documentLibrary`), you MUST set these two flags — otherwise every `.docx`,
+> `.xlsx` and `.pptx` you save is lost.**
+>
+> ```toml
+> [[mount]]
+> extra_mount_opts = ["--ignore-size", "--ignore-checksum"]
+> ```
+>
+> SharePoint **modifies Office files server-side on upload** — it injects its
+> own metadata, so the stored file is several kilobytes larger than what you
+> sent, and not even byte-stable between two attempts. rclone compares size and
+> hash after the copy, sees a mismatch, declares the transfer corrupt, **deletes
+> the copy it just uploaded** and retries. Forever. The file stays in the local
+> VFS cache and never reaches the cloud.
+>
+> It hits `.docx`, `.xlsx`, `.pptx` and leaves `.md`, `.pdf`, images and
+> everything else alone — so the mount looks perfectly healthy while exactly
+> your Word and Excel documents pile up unsent. Observed in the wild for 7 days
+> and 3 documents before anyone noticed.
+>
+> `cloud-sync --status` now reports this as `📤 UPLOADS STUCK` and exits
+> non-zero. Full explanation, the reason `--ignore-checksum` is needed as well,
+> and how to rescue files that are already stuck:
+> [When uploads get stuck](#when-uploads-get-stuck).
+
 ```text
 $ cloud-sync --status
 Configuration  ~/.config/cloud-sync/config.toml
@@ -290,17 +319,49 @@ Step 4 is the verification: the entry only goes `"Dirty": false` in
 ### Orphaned cache roots
 
 Renaming a remote leaves its cache subtree behind under a name nothing points
-at any more. Unuploaded files in there are retried by nobody and shown by
-nothing — so `--status` scans for them and reports them as `🚨 UNREACHABLE
-DATA`:
+at any more. Nothing cleans that up: `--vfs-cache-max-age` only ever touches
+the cache of a *running* mount, and no mount knows this one. So `--status`
+scans both cache trees for subtrees no `[[mount]]` claims and tells you which
+of the two problems you have.
+
+**`🚨 UNREACHABLE DATA` — files in there were never uploaded.** No process will
+ever retry them, and the cached copy is the only one that exists. Rescue first,
+delete second:
 
 ```bash
-cloud-sync --status
-cp -a ~/.cache/rclone/vfs/"Team - X"/<path> ~/rescue/   # rescue first
-rm -rf ~/.cache/rclone/vfs/"Team - X" ~/.cache/rclone/vfsMeta/"Team - X"
+cloud-sync --status                       # lists the pending paths
+cp -a ~/.cache/rclone/vfs/"Team - X"/<path> ~/rescue/
+# copy them back in through the current mount, verify, then remove the root
 ```
 
-Copy anything you still want back in through the current mount afterwards.
+**`🧹 LEFTOVER CACHE` — only blobs of files that did reach the cloud.** Pure
+clutter, no risk, and it does not affect the exit code. `--status` prints the
+removal command for you:
+
+```text
+Team - X  🧹 LEFTOVER CACHE
+  ~/.cache/rclone/vfs/Team - X
+  Cached         13 file(s), 1.6 MiB
+                 already in the cloud; no mount cleans this up
+  Remove         rm -r '~/.cache/rclone/vfs/Team - X' '~/.cache/rclone/vfsMeta/Team - X'
+                 no mount uses it, so this is safe while everything runs
+```
+
+Both trees must go: deleting the sidecars under `vfsMeta/` without the blobs
+under `vfs/` (or the other way round) leaves half of it behind — and the half
+without sidecars is invisible to any "is anything unuploaded?" check.
+
+For the cache of a mount that *is* configured, stop its unit first, or rclone
+writes its in-memory state back on exit:
+
+```bash
+systemctl --user stop rclone-mount@<instance>.service
+rm -r ~/.cache/rclone/vfs/"<remote>" ~/.cache/rclone/vfsMeta/"<remote>"
+systemctl --user start rclone-mount@<instance>.service
+```
+
+Never `rm -r ~/.cache/rclone` wholesale: `bisync/` in there holds the baselines
+of every `[[pair]]`, and losing those forces a `cloud-sync --resync`.
 
 ## Units
 
@@ -337,6 +398,7 @@ at logout, so a fresh session is allowed to warn you once again.
 | `🚨 HIDDEN FILES`      | **data at risk**: something wrote into an unmounted mountpoint. Those files vanish from view once it mounts. Move them out, empty the directory, then mount |
 | `📤 UPLOADS STUCK`     | **data at risk**: files written to the mount never reached the cloud and exist only in the local cache. See [When uploads get stuck](#when-uploads-get-stuck) |
 | `🚨 UNREACHABLE DATA`  | **data at risk**: a cache root left behind by a renamed remote still holds unuploaded files, and no mount will ever retry them. See [Orphaned cache roots](#orphaned-cache-roots) |
+| `🧹 LEFTOVER CACHE`    | harmless clutter: a cache root nothing points at any more, holding only files that did reach the cloud. `--status` prints the `rm -r` for it; the exit code stays 0 |
 | `token expired`        | `rclone config reconnect <remote>:`                                                                                                                         |
 
 Conflicts are resolved with `--conflict-resolve newer`; the losing version is

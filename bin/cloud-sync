@@ -807,12 +807,13 @@ _VFS_SAMPLE_CAP = 20
 _VFS_TIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$")
 
 
-def _vfs_meta_dir(opts: "list[str]") -> Path:
+def _vfs_cache_dir(opts: "list[str]") -> Path:
     """
-    The vfsMeta directory the given 'rclone mount' flags write into.
+    The cache directory the given 'rclone mount' flags write into.
 
-    --cache-dir on the mount wins, then $RCLONE_CACHE_DIR, then rclone's own
-    default of ~/.cache/rclone.
+    It holds two parallel trees: 'vfs' with the file blobs and 'vfsMeta' with
+    one JSON sidecar each.  --cache-dir on the mount wins, then
+    $RCLONE_CACHE_DIR, then rclone's own default of ~/.cache/rclone.
     """
     cache_dir = None
     for i, opt in enumerate(opts):
@@ -822,7 +823,7 @@ def _vfs_meta_dir(opts: "list[str]") -> Path:
             cache_dir = opt.split("=", 1)[1]
     if not cache_dir:
         cache_dir = os.environ.get("RCLONE_CACHE_DIR") or "~/.cache/rclone"
-    return _expand(cache_dir) / "vfsMeta"
+    return _expand(cache_dir)
 
 
 def _remote_cache_path(remote: str) -> str:
@@ -845,7 +846,7 @@ def vfs_cache_root(m: Mount) -> Path:
     the cache directory: a subtree in there may belong to a remote that no
     longer exists (see orphan_cache_roots()).
     """
-    return _vfs_meta_dir(m.opts) / _remote_cache_path(m.remote)
+    return _vfs_cache_dir(m.opts) / "vfsMeta" / _remote_cache_path(m.remote)
 
 
 def _vfs_modtime(value) -> "float | None":
@@ -903,38 +904,66 @@ def vfs_backlog(root: Path, min_age: float, now: "float | None" = None) -> dict:
     return found
 
 
+def _tree_size(root: Path) -> "tuple[int, int]":
+    """(files, bytes) below `root`; (0, 0) if it does not exist."""
+    files = total = 0
+    for dirpath, _dirs, names in os.walk(root, onerror=lambda _e: None):
+        for name in names:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+                files += 1
+    return files, total
+
+
 def orphan_cache_roots() -> "list[dict]":
     """
-    VFS cache subtrees holding unuploaded files that no [[mount]] claims.
+    Cache subtrees that no [[mount]] claims any more.
 
-    Renaming a remote leaves its old cache subtree behind.  Nothing points at it
-    any more, so nothing will ever retry those uploads: the newest version of
-    those files exists only there, and no other part of this tool would ever
-    mention them.  Only roots that actually hold dirty data are reported - a
-    stale but fully uploaded subtree is just wasted disk.
+    Renaming a remote leaves its old subtree behind under the old name.  Two
+    different problems hide in there, and they are reported differently:
+
+      * unuploaded files - nothing points at them, so nothing will ever retry
+        the upload.  That is the newest copy of those files, and no other part
+        of this tool would mention it.  Data at risk.
+      * everything else - blobs of files that did reach the cloud.  Harmless,
+        but nothing cleans them up either: --vfs-cache-max-age only ever
+        touches the cache of a running mount, and no mount knows this one.
+
+    Both trees are scanned: deleting the sidecars in vfsMeta/ without the blobs
+    in vfs/ (or the other way round) leaves exactly half of it behind.
     """
     # The default cache directory is scanned even when no mount uses it: data
     # left behind by a mount that was removed from the config lives there too.
-    claimed: "dict[Path, set[str]]" = {_vfs_meta_dir([]): set()}
+    claimed: "dict[Path, set[str]]" = {_vfs_cache_dir([]): set()}
     for m in CFG.mounts:
-        meta = _vfs_meta_dir(m.opts)
         # The first path segment is what a top-level scan sees: a mount of
         # "remote:sub" still claims the whole "remote" subtree.
-        claimed.setdefault(meta, set()).add(_remote_cache_path(m.remote).split("/")[0])
+        claimed.setdefault(_vfs_cache_dir(m.opts), set()).add(
+            _remote_cache_path(m.remote).split("/")[0])
 
     orphans = []
-    for meta, names in claimed.items():
-        try:
-            entries = sorted(p for p in meta.iterdir() if p.is_dir())
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.name in names:
+    for cache, names in claimed.items():
+        unclaimed: "set[str]" = set()
+        for tree in ("vfsMeta", "vfs"):
+            try:
+                unclaimed |= {p.name for p in (cache / tree).iterdir()
+                              if p.is_dir() and p.name not in names}
+            except OSError:
                 continue
+        for name in sorted(unclaimed):
+            meta_root, data_root = cache / "vfsMeta" / name, cache / "vfs" / name
             # No mount retries these, so every dirty entry counts regardless of age.
-            backlog = vfs_backlog(entry, min_age=0.0)
-            if backlog["count"]:
-                orphans.append({"name": entry.name, **backlog})
+            backlog = vfs_backlog(meta_root, min_age=0.0)
+            files, size = _tree_size(data_root)
+            meta_files, meta_size = _tree_size(meta_root)
+            if not files and not meta_files:
+                continue   # empty leftover directories: nothing to report
+            orphans.append({
+                "name": name, "root": str(data_root), "meta_root": str(meta_root),
+                "files": files or meta_files, "bytes": size or meta_size,
+                "count": backlog["count"], "dirty_bytes": backlog["bytes"],
+                "oldest": backlog["oldest"], "sample": backlog["sample"],
+            })
     return orphans
 
 
@@ -1129,12 +1158,16 @@ def check_orphan_caches() -> "list[dict]":
     """
     global _last_orphan_count
     orphans = orphan_cache_roots()
-    if not orphans:
+    # Only unreachable *unuploaded* files are worth waking someone up for.
+    # Leftover blobs of files that did reach the cloud are clutter; --status
+    # says how to remove them, a desktop notification would just nag.
+    stuck = [o for o in orphans if o["count"]]
+    total = sum(o["count"] for o in stuck)
+    if not total:
         _last_orphan_count = 0
         notify_ok("vfs-orphan", "Cloud sync - orphaned cache cleared", "")
         return orphans
-    total = sum(o["count"] for o in orphans)
-    names = ", ".join(o["name"] for o in orphans[:3])
+    names = ", ".join(o["name"] for o in stuck[:3])
     # Same rule as the mount states: say it when it changes, not every poll.
     log.log(logging.DEBUG if _last_orphan_count == total else logging.WARNING,
             "Orphaned VFS cache: %d unuploaded file(s) under %s", total, names)
@@ -1695,7 +1728,9 @@ def print_status(as_json: bool = False) -> int:
     # Cache subtrees nobody mounts any more: unreachable local-only data, the
     # same class of problem as MOUNT_SHADOWED and just as invisible otherwise.
     report["orphan_caches"] = orphan_cache_roots()
-    if report["orphan_caches"]:
+    # Unreachable *unuploaded* data is a failure; leftover blobs of files that
+    # did reach the cloud are only clutter, and must not make monitoring red.
+    if any(o["count"] for o in report["orphan_caches"]):
         healthy = False
 
     if as_json:
@@ -1794,16 +1829,24 @@ def print_status(as_json: bool = False) -> int:
         print(rule("🗃️ Orphaned cache"))
         for o in report["orphan_caches"]:
             print()
-            print(f"{c(o['name'], 'bold', 'blue')}  🚨 {c('UNREACHABLE DATA', 'magenta', 'bold')}")
+            mark = f"🚨 {c('UNREACHABLE DATA', 'magenta', 'bold')}" if o["count"] \
+                else f"🧹 {c('LEFTOVER CACHE', 'yellow', 'bold')}"
+            print(f"{c(o['name'], 'bold', 'blue')}  {mark}")
             print(f"  {c(o['root'], 'grey')}")
-            print(f"  {label('Unuploaded')}{o['count']} file(s), {_human_bytes(o['bytes'])}, "
-                  f"oldest {_duration(o['oldest'])}")
-            for path in o["sample"][:5]:
-                print(f"  {label('')}{c('· ' + path, 'grey')}")
-            if o["count"] > 5:
-                print(f"  {label('')}{c('… and ' + str(o['count'] - 5) + ' more', 'grey')}")
-            print(f"  {label('')}{c('no [[mount]] points here, so nothing will ever upload them', 'magenta')}")
-            print(f"  {label('Fix')}{c('copy them out of the cache, then delete the directory', 'grey')}")
+            print(f"  {label('Cached')}{o['files']} file(s), {_human_bytes(o['bytes'])}")
+            if o["count"]:
+                print(f"  {label('Unuploaded')}{c(str(o['count']) + ' of them', 'magenta', 'bold')}, "
+                      f"{_human_bytes(o['dirty_bytes'])}, oldest {_duration(o['oldest'])}")
+                for path in o["sample"][:5]:
+                    print(f"  {label('')}{c('· ' + path, 'grey')}")
+                if o["count"] > 5:
+                    print(f"  {label('')}{c('… and ' + str(o['count'] - 5) + ' more', 'grey')}")
+                print(f"  {label('')}{c('no [[mount]] points here, so nothing will ever upload them -', 'magenta')}")
+                print(f"  {label('')}{c('copy them out of the cache before deleting anything', 'magenta')}")
+            else:
+                print(f"  {label('')}{c('already in the cloud; no mount cleans this up', 'grey')}")
+            print(f"  {label('Remove')}{c('rm -r ' + shlex.quote(o['root']) + ' ' + shlex.quote(o['meta_root']), 'bold')}")
+            print(f"  {label('')}{c('no mount uses it, so this is safe while everything runs', 'grey')}")
 
     print()
     print(c("Details: cloud-sync --diff   (real comparison against the cloud)", "grey"))
