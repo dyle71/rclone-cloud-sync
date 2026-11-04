@@ -1,0 +1,17 @@
+[Unit]
+Description=cloud-sync sleep guard (stops the mounts around suspend)
+# A mount kept up across suspend wakes with dead connections, and whatever
+# looks into it then can block suspend itself.  See --sleep-guard.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+ExecStart=%h/.local/bin/cloud-sync --sleep-guard
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloud-sync-sleep
+
+[Install]
+WantedBy=default.target

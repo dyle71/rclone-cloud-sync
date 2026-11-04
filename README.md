@@ -94,6 +94,8 @@ notified through the same edge-triggered logic.
 - Linux with a **systemd user session**
 - **rclone** ≥ 1.60 ([install](https://rclone.org/install/))
 - **fuse3** — only if you use `[[mount]]`
+- **gdbus** (part of glib2, on every desktop) and `systemd-inhibit` — only for
+  `[[mount]]`, to stop the mounts around suspend
 - **Python** ≥ 3.11 (for `tomllib`) with the **watchdog** module
   - Arch: `pacman -S python-watchdog`
   - Debian/Ubuntu: `apt install python3-watchdog`
@@ -176,6 +178,7 @@ cloud-sync --resync              # establish a baseline (uninitialized pairs onl
 cloud-sync --resync --pair NAME  # …for one pair
 cloud-sync --refresh-tokens      # renew every remote's OAuth token
 cloud-sync --export-mount-units  # regenerate mount units after a config change
+cloud-sync --sleep-guard         # stop the mounts around suspend (run by its unit)
 ```
 
 `--status` is instant and safe to run in a prompt or a loop: only the
@@ -371,6 +374,7 @@ of every `[[pair]]`, and losing those forces a `cloud-sync --resync`.
 | `cloud-sync-periodic.timer`  | hourly `--once` fallback, in case a thread inside the daemon dies                            |
 | `rclone-token-refresh.timer` | daily token refresh for every remote in the config                                           |
 | `rclone-mount@.service`      | template, one instance per `[[mount]]`                                                       |
+| `cloud-sync-sleep.service`   | sleep guard: stops the mounts before suspend, starts them again on wake                      |
 
 ## Notifications
 
@@ -395,6 +399,7 @@ at logout, so a fresh session is allowed to warn you once again.
 | `🧹 Lock STALE`        | leftover from a crash; the next run clears it                                                                                                               |
 | `🔄 SETTINGS OUTDATED` | config changed without re-export: `cloud-sync --export-mount-units`, then restart the unit                                                                  |
 | `🧟 STALE` (mount)     | the mount hangs: `systemctl --user restart rclone-mount@<instance>.service`                                                                                 |
+| *(suspend fails, a desktop process hangs)* | a process waits on a mount whose connection died. The kernel log names it: `journalctl -k -g 'refusing to freeze'`. `kill -9` frees it (FUSE waits yield to SIGKILL), restarting the mount unit frees every waiter at once. See [Suspend and dead connections](#suspend-and-dead-connections) |
 | `🚨 HIDDEN FILES`      | **data at risk**: something wrote into an unmounted mountpoint. Those files vanish from view once it mounts. Move them out, empty the directory, then mount |
 | `📤 UPLOADS STUCK`     | **data at risk**: files written to the mount never reached the cloud and exist only in the local cache. See [When uploads get stuck](#when-uploads-get-stuck) |
 | `🚨 UNREACHABLE DATA`  | **data at risk**: a cache root left behind by a renamed remote still holds unuploaded files, and no mount will ever retry them. See [Orphaned cache roots](#orphaned-cache-roots) |
@@ -446,6 +451,34 @@ timer unit permanently red, which buried the failures that mattered.
 takes seconds to minutes; polling every 30 s meant it essentially never stopped,
 for no benefit. Local edits are caught by inotify within a second, so polling
 only needs to find changes made *elsewhere*.
+
+**Mounts give up on a dead connection within a minute.** <a id="suspend-and-dead-connections"></a>
+Suspend, or a switch between networks, kills TCP connections without telling
+either end. A lookup rclone has in flight on such a connection is only noticed
+by its idle timeout, and with rclone's defaults (`--timeout 5m`,
+`--low-level-retries 10`) one `stat` can hang for most of an hour. The process
+that asked hangs with it, uninterruptibly - typically a desktop daemon
+scanning mount points. The kernel cannot freeze a task in that state, so
+suspend is aborted with `Device or resource busy`, again on every retry, and
+anything that process provides goes with it: when that is the NetworkManager
+secret agent, Wi-Fi with an auto-started VPN never finishes connecting. The
+default `--contimeout 15s --timeout 30s --low-level-retries 3` bounds that to
+about a minute; a lookup that fails returns an I/O error instead of hanging.
+
+A minute is still longer than the 20 s the kernel gives a task to freeze, so
+`cloud-sync-sleep.service` removes the race altogether: it holds a logind
+*delay* lock, stops the mount units when sleep is announced, releases the lock,
+and starts them again on wake - with `--no-block`, because the network is rarely
+back by then; the units fail fast and retry until it is. Files still waiting
+for upload stay in the VFS cache and go up once the mount is back. A mount with
+a file open **for writing** is left alone and logged instead: stopping it would
+break that program's descriptor and lose what it had not written yet.
+
+It is a user service and not a `system-sleep` hook on purpose. By default
+systemd freezes `user.slice` *before* it runs those hooks, so a hook can no
+longer reach the user manager to stop anything, and blocks suspend trying.
+`systemd-suspend.service(8)` itself calls such hooks hacks and points to
+inhibitor locks.
 
 **No `network-online.target` dependency.** That target does not exist in the
 systemd **user** manager — `systemctl --user list-unit-files

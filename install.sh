@@ -35,6 +35,9 @@ ok "rclone $(rclone version | head -1 | awk '{print $2}')"
 command -v fusermount >/dev/null || command -v fusermount3 >/dev/null \
     || warn "fusermount not found - [[mount]] entries will not work (install fuse3)"
 
+command -v gdbus >/dev/null && command -v systemd-inhibit >/dev/null \
+    || warn "gdbus or systemd-inhibit not found - mounts will not be stopped around suspend (install glib2)"
+
 PY=$(command -v python3) || die "python3 not found"
 "$PY" - <<'PYEOF' || die "python 3.11+ required (tomllib)"
 import sys
@@ -92,7 +95,8 @@ say "Enabling units"
 systemctl --user enable --now cloud-sync.service >/dev/null
 systemctl --user enable --now cloud-sync-periodic.timer >/dev/null
 systemctl --user enable --now rclone-token-refresh.timer >/dev/null
-ok "cloud-sync.service, periodic timer, token refresh timer"
+systemctl --user enable --now cloud-sync-sleep.service >/dev/null
+ok "cloud-sync.service, periodic timer, token refresh timer, sleep guard"
 
 shopt -s nullglob
 for env_file in "$CONF_DIR"/mounts/*.env; do

@@ -42,6 +42,9 @@ Modes:
                 the printed paths).  Exit code 0 only if everything matches.
   --refresh-tokens
                 Renew the OAuth token of every configured remote once and exit.
+  --sleep-guard Stop the mounts when the system goes to sleep and start them
+                again on wake, holding a logind delay lock so sleep waits for
+                it.  Runs until killed; cloud-sync-sleep.service runs it.
 
   --status and --diff also accept --json for scripting/monitoring.
 
@@ -126,6 +129,12 @@ DEFAULT_SETTINGS = {
 #   --poll-interval 1m       pick up changes made elsewhere within a minute
 #                            instead of waiting for dir-cache-time to lapse
 #   --no-modtime             do not fetch mtimes just to list a directory
+#   --contimeout 15s         a request on a connection that died under it
+#   --timeout 30s            (suspend, network switch) fails within about a
+#   --low-level-retries 3    minute.  rclone's defaults (1m, 5m, 10 retries)
+#                            let one lookup hang for most of an hour, and the
+#                            process that asked hangs with it in a state the
+#                            kernel cannot freeze - so suspend fails as well
 DEFAULT_MOUNT_OPTS = [
     "--vfs-cache-mode", "writes",
     "--vfs-cache-max-age", "24h",
@@ -134,6 +143,9 @@ DEFAULT_MOUNT_OPTS = [
     "--poll-interval", "1m",
     "--vfs-fast-fingerprint",
     "--no-modtime",
+    "--contimeout", "15s",
+    "--timeout", "30s",
+    "--low-level-retries", "3",
 ]
 
 # The systemd template unit that runs every mount, one instance per [[mount]].
@@ -1256,6 +1268,153 @@ def mount_watch_loop(stop_event: threading.Event):
             log.exception("Mount check failed")
 
 
+# ── Suspend ──────────────────────────────────────────────────────────────────
+# A mount that is up across a suspend wakes with every connection dead, and a
+# lookup in flight on one of them blocks whoever asked in a state the kernel
+# cannot freeze: suspend is aborted, again on every retry.  --sleep-guard holds
+# a logind delay lock, stops the mounts when sleep is announced and starts them
+# again on wake.  A system-sleep hook cannot do this: by default user.slice is
+# frozen before those hooks run, so they can no longer reach the user manager.
+#
+# Everything goes through systemd-inhibit and gdbus, not a D-Bus binding, so no
+# dependency is added.  busctl would not do: 'busctl monitor' needs root.
+
+# logind waits InhibitDelayMaxSec (5 s by default) for a delay lock, then
+# suspends anyway.  Stopping the units must fit inside that.
+_SLEEP_STOP_TIMEOUT = 4.0
+_PREPARE_FOR_SLEEP = "org.freedesktop.login1.Manager.PrepareForSleep"
+
+
+def _take_sleep_lock() -> subprocess.Popen:
+    """
+    Hold a delay lock for as long as the returned process lives.
+
+    'cat' reading a pipe we own keeps systemd-inhibit alive; closing the pipe
+    releases the lock, and so does our own death, since the pipe goes with us.
+    """
+    return subprocess.Popen(
+        ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=cloud-sync",
+         "--why=Unmount cloud drives before sleep", "cat"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+
+
+def _release_sleep_lock(lock: "subprocess.Popen | None") -> None:
+    if lock is None:
+        return
+    with contextlib.suppress(Exception):
+        lock.stdin.close()
+    try:
+        lock.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        lock.kill()
+
+
+def _writers_under(path: Path) -> "list[str]":
+    """
+    Processes of ours holding a file below `path` open for writing.
+
+    Stopping the mount under them breaks that descriptor, and with it whatever
+    the program had not written yet.  Only /proc is read: resolving an fd link
+    never reaches the FUSE daemon, so this cannot hang on the mount it checks.
+    """
+    prefix = str(path).rstrip("/") + "/"
+    writers = []
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            for fd in (pid_dir / "fd").iterdir():
+                if not os.readlink(fd).startswith(prefix):
+                    continue
+                flags = (pid_dir / "fdinfo" / fd.name).read_text().split("flags:")[1].split()[0]
+                if int(flags, 8) & os.O_ACCMODE != os.O_RDONLY:
+                    writers.append(f"{(pid_dir / 'comm').read_text().strip()} ({pid_dir.name})")
+                    break
+        except (OSError, IndexError, ValueError):
+            continue   # gone meanwhile, or not ours to read
+    return writers
+
+
+def _stop_mounts_for_sleep() -> "list[str]":
+    """Stop every active mount unit that is safe to stop.  Returns the stopped units."""
+    active = [m for m in CFG.mounts if m.unit and _unit_active_state(m.unit) == "active"]
+    units = []
+    for m in active:
+        writers = _writers_under(m.mountpoint)
+        if writers:
+            # Better a mount that may hang for a minute after wake than a
+            # document that cannot be saved.  The timeouts cover this case.
+            log.warning("[%s] kept mounted across sleep - open for writing by %s",
+                        m.name, ", ".join(writers))
+        else:
+            units.append(m.unit)
+    if not units:
+        return []
+    log.info("Sleep announced - stopping %s", ", ".join(units))
+    try:
+        # One call, so systemd stops them in parallel.
+        subprocess.run(["systemctl", "--user", "stop", *units],
+                       capture_output=True, timeout=_SLEEP_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # The stop jobs carry on inside systemd; we only stop waiting for them.
+        log.warning("Mounts did not stop within %.0fs - letting the system sleep anyway",
+                    _SLEEP_STOP_TIMEOUT)
+    return units
+
+
+def sleep_guard() -> int:
+    """--sleep-guard: stop the mounts around every suspend.  Runs until killed."""
+    if not any(m.unit for m in CFG.mounts):
+        log.info("No [[mount]] in the config - nothing to guard")
+        return 0
+
+    stopping = threading.Event()
+    monitor = subprocess.Popen(
+        ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+         "--object-path", "/org/freedesktop/login1"],
+        stdout=subprocess.PIPE, text=True)
+    lock = _take_sleep_lock()
+    stopped: "list[str]" = []
+
+    def shutdown(signum, _frame):
+        log.info("Received signal %d - sleep guard exiting", signum)
+        stopping.set()
+        monitor.terminate()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    log.info("Sleep guard watching %d mount(s)", len(CFG.mounts))
+
+    try:
+        for line in monitor.stdout:
+            if _PREPARE_FOR_SLEEP not in line:
+                continue
+            if "(true," in line:
+                stopped = _stop_mounts_for_sleep()
+                _release_sleep_lock(lock)
+                lock = None
+            elif "(false," in line:
+                if stopped:
+                    log.info("Woke up - starting %s", ", ".join(stopped))
+                    # --no-block: the network is rarely back yet.  The units
+                    # fail fast and Restart= retries them until it is.
+                    subprocess.run(["systemctl", "--user", "start", "--no-block", *stopped],
+                                   capture_output=True, timeout=10)
+                    stopped = []
+                if lock is None:
+                    lock = _take_sleep_lock()
+    finally:
+        _release_sleep_lock(lock)
+        monitor.terminate()
+
+    if stopping.is_set():
+        return 0
+    # gdbus went away on its own - the bus restarted, or it was killed.  Exit
+    # non-zero so systemd restarts us instead of leaving the mounts unguarded.
+    log.error("Lost the connection to logind (gdbus exited with %s)", monitor.wait())
+    return 1
+
+
 def sync_all(reason: str, pairs: "list[Pair] | None" = None) -> str:
     """Bisync every pair sequentially.  Returns the most severe RESULT_* seen."""
     return worst_result([do_bisync(pair, reason)
@@ -1959,6 +2118,8 @@ def main():
     parser.add_argument("--list", action="store_true", help="List configured pairs and mounts, then exit")
     parser.add_argument("--refresh-tokens", action="store_true",
                         help="Renew the OAuth token of every configured remote once and exit")
+    parser.add_argument("--sleep-guard", action="store_true",
+                        help="Stop the mounts around every suspend (cloud-sync-sleep.service)")
     parser.add_argument("--export-mount-units", action="store_true",
                         help="Write the per-mount EnvironmentFiles the mount units read, then exit")
     parser.add_argument("--dry-run", action="store_true",
@@ -1999,6 +2160,9 @@ def main():
 
     if args.status:
         sys.exit(print_status(as_json=args.json))
+
+    if args.sleep_guard:
+        sys.exit(sleep_guard())
 
     if args.diff:
         targets = CFG.pairs

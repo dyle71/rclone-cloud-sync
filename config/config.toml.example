@@ -133,6 +133,7 @@ mountpoint = "~/Documents/Cloud/work/Team"
 # without having to restate the rest.  The defaults are:
 #     --vfs-cache-mode writes --vfs-cache-max-age 24h --vfs-cache-max-size 20G
 #     --dir-cache-time 1h --poll-interval 1m --vfs-fast-fingerprint --no-modtime
+#     --contimeout 15s --timeout 30s --low-level-retries 3
 #
 # A SharePoint document library rewrites .docx/.xlsx/.pptx files server-side on
 # upload, so the stored object is bigger than what was sent and rclone's
@@ -147,6 +148,9 @@ mountpoint = "~/Documents/Cloud/work/Team"
 #     "--vfs-cache-mode", "full",     # cache reads too - faster re-reads, more disk
 #     "--dir-cache-time", "30m",
 #     "--poll-interval", "1m",
+#     "--contimeout", "15s",          # keep these three: without them a dead
+#     "--timeout", "30s",             # connection can hang a lookup, and the
+#     "--low-level-retries", "3",     # suspend waiting on it, for most of an hour
 # ]
 
 # `unit` overrides the template entirely, for a hand-written mount unit.  Such a

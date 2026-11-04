@@ -22,7 +22,8 @@ for env_file in "$CONF_DIR"/mounts/*.env; do
 done
 shopt -u nullglob
 
-for unit in cloud-sync.service cloud-sync-periodic.timer rclone-token-refresh.timer; do
+for unit in cloud-sync.service cloud-sync-periodic.timer rclone-token-refresh.timer \
+            cloud-sync-sleep.service; do
     systemctl --user disable --now "$unit" 2>/dev/null || true
     ok "$unit"
 done
@@ -31,7 +32,8 @@ say
 say "Removing links"
 rm -f "$BIN_DIR/cloud-sync"
 for unit in cloud-sync.service cloud-sync-periodic.service cloud-sync-periodic.timer \
-            rclone-token-refresh.service rclone-token-refresh.timer rclone-mount@.service; do
+            rclone-token-refresh.service rclone-token-refresh.timer rclone-mount@.service \
+            cloud-sync-sleep.service; do
     rm -f "$UNIT_DIR/$unit"
 done
 systemctl --user daemon-reload
