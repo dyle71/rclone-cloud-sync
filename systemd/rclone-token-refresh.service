@@ -1,8 +1,8 @@
 [Unit]
-Description=rclone Token Refresh for HTL Teams
+Description=rclone token refresh for every configured remote
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/rclone lsd "OneDrive HTL Villach:"
-ExecStart=/usr/bin/rclone lsd "Teams - Lehrer IF MT:"
-ExecStart=/usr/bin/rclone lsd "Teams - IT Management:"
+# The remote list comes from the sync-onedrive config, so it cannot drift out
+# of sync with the remotes that are actually in use.
+ExecStart=%h/.local/bin/cloud-sync --refresh-tokens

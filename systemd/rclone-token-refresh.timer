@@ -1,5 +1,5 @@
 [Unit]
-Description=rclone Token daildaily refresh
+Description=rclone token refresh (daily)
 
 [Timer]
 OnCalendar=daily
