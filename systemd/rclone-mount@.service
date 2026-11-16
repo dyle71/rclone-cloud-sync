@@ -26,7 +26,7 @@ EnvironmentFile=%h/.config/cloud-sync/mounts/%i.env
 ExecStartPre=/usr/bin/mkdir -p "${MOUNTPOINT}"
 ExecStart=/usr/bin/rclone mount "${REMOTE}" "${MOUNTPOINT}" $MOUNT_OPTS
 # -z (lazy) so a stop does not fail while a file is still open.
-ExecStop=/bin/fusermount -uz "${MOUNTPOINT}"
+ExecStop=/usr/bin/fusermount3 -uz "${MOUNTPOINT}"
 # Type=notify means systemd waits for rclone to report the mount as ready.
 # Without a bound it waits forever on a machine that booted without network.
 TimeoutStartSec=90

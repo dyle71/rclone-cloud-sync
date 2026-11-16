@@ -399,6 +399,7 @@ at logout, so a fresh session is allowed to warn you once again.
 | `🧹 Lock STALE`        | leftover from a crash; the next run clears it                                                                                                               |
 | `🔄 SETTINGS OUTDATED` | config changed without re-export: `cloud-sync --export-mount-units`, then restart the unit                                                                  |
 | `🧟 STALE` (mount)     | the mount hangs: `systemctl --user restart rclone-mount@<instance>.service`                                                                                 |
+| `🔀 FOREIGN OWNER`     | another unit (often one from before cloud-sync) or a hand-started rclone serves the mount, and the configured unit keeps failing with "already mounted". `--status` prints the fix: disable that unit, restart the configured one |
 | *(suspend fails, a desktop process hangs)* | a process waits on a mount whose connection died. The kernel log names it: `journalctl -k -g 'refusing to freeze'`. `kill -9` frees it (FUSE waits yield to SIGKILL), restarting the mount unit frees every waiter at once. See [Suspend and dead connections](#suspend-and-dead-connections) |
 | `🚨 HIDDEN FILES`      | **data at risk**: something wrote into an unmounted mountpoint. Those files vanish from view once it mounts. Move them out, empty the directory, then mount |
 | `📤 UPLOADS STUCK`     | **data at risk**: files written to the mount never reached the cloud and exist only in the local cache. See [When uploads get stuck](#when-uploads-get-stuck) |
@@ -474,6 +475,23 @@ for upload stay in the VFS cache and go up once the mount is back. A mount with
 a file open **for writing** is left alone and logged instead: stopping it would
 break that program's descriptor and lose what it had not written yet.
 
+The guard goes by what is mounted, not by which unit is active. A mount served
+by some other unit - a leftover from an older setup, say - hangs a suspend just
+the same, while the configured unit, failing with "already mounted", is never
+active. So it stops the configured unit and the one actually serving the mount,
+and whatever is still mounted 3 s later is cut loose: aborting its FUSE
+connection (`/sys/fs/fuse/connections/<n>/abort`) fails every request in
+flight, which frees the tasks stuck in it, and a lazy unmount takes the
+mountpoint away. On wake only the configured unit is started, so it takes over.
+
+**Mount checks never queue up on a hung mount.** Whether something is mounted
+comes from `/proc/self/mountinfo`: even a `stat()` of a mountpoint is a request
+to its FUSE daemon and hangs on a dead one. The one real read, the readability
+probe, runs in a thread that may never come back; while it hangs, the next
+check waits on it instead of starting another. Before, every poll left one more
+thread stuck in a dead mount, and each one alone made the kernel abort a
+suspend.
+
 It is a user service and not a `system-sleep` hook on purpose. By default
 systemd freezes `user.slice` *before* it runs those hooks, so a hook can no
 longer reach the user manager to stop anything, and blocks suspend trying.
@@ -518,7 +536,8 @@ What is portable: the `config.toml` model, the two-mode split, `rclone bisync`
 and `rclone mount` themselves, and the reasoning in *Design notes*.
 
 What is not: systemd units, `notify-send`, `flock`, inotify via `watchdog`
-(actually cross-platform, but tested here on Linux only), and `fusermount`.
+(actually cross-platform, but tested here on Linux only), and `fusermount3`
+(or fuse2's `fusermount`).
 
 ### Windows
 

@@ -42,9 +42,11 @@ Modes:
                 the printed paths).  Exit code 0 only if everything matches.
   --refresh-tokens
                 Renew the OAuth token of every configured remote once and exit.
-  --sleep-guard Stop the mounts when the system goes to sleep and start them
-                again on wake, holding a logind delay lock so sleep waits for
-                it.  Runs until killed; cloud-sync-sleep.service runs it.
+  --sleep-guard Stop the mounts when the system goes to sleep - whichever unit
+                runs them - and start them again on wake, holding a logind
+                delay lock so sleep waits for it.  A mount that does not stop
+                in time is cut loose.  Runs until killed;
+                cloud-sync-sleep.service runs it.
 
   --status and --diff also accept --json for scripting/monitoring.
 
@@ -70,6 +72,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -998,6 +1001,9 @@ def orphan_cache_roots() -> "list[dict]":
 #              the local VFS cache unuploaded.  Reads and writes work, so every
 #              other check is happy while the cloud copy silently falls behind.
 #              The other state that can cost data.
+#   foreign    mounted and answering, but not by the configured unit - a second
+#              unit, or an rclone started by hand, got there first.  The
+#              configured unit then fails with "already mounted", forever.
 
 MOUNT_OK, MOUNT_STALE, MOUNT_UNMOUNTED = "ok", "stale", "unmounted"
 MOUNT_UNIT_FAILED, MOUNT_SHADOWED = "unit-failed", "shadowed"
@@ -1005,6 +1011,7 @@ MOUNT_UPLOAD_STUCK = "upload-stuck"
 # Mounted and fine, but its EnvironmentFile no longer matches the config: the
 # running mount uses stale settings until --export-mount-units and a restart.
 MOUNT_OUTDATED = "unit-outdated"
+MOUNT_FOREIGN = "foreign"
 
 _MOUNT_PROBE_TIMEOUT = 3.0
 
@@ -1024,26 +1031,124 @@ def _unit_active_state(unit: str) -> str:
         return "unknown"
 
 
+def _unit_main_pid(unit: str) -> int:
+    """MainPID of a user unit, 0 if it has none or cannot be asked."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
+                           capture_output=True, text=True, timeout=5)
+        return int((r.stdout or "").strip() or 0)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0
+
+
+def _mount_key(path: "Path | str") -> str:
+    """A mountpoint spelled the way /proc/self/mountinfo spells it, for comparing."""
+    return os.path.normpath(os.path.expanduser(str(path)))
+
+
+def _fuse_mounts() -> "dict[str, int]":
+    """
+    The FUSE mounts in our namespace: mountpoint -> fusectl connection number.
+
+    Read from /proc/self/mountinfo, which the kernel answers itself.  A stat()
+    on a mountpoint - os.path.ismount(), Path.exists() - is a request to the
+    FUSE daemon behind it, and on a hung mount it hangs the caller as surely as
+    a read does.
+    """
+    mounts = {}
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return mounts
+    for line in lines:
+        head, _, tail = line.partition(" - ")
+        fields = head.split()
+        fstype = tail.split(" ", 1)[0]
+        if len(fields) < 5 or not (fstype == "fuse" or fstype.startswith("fuse.")):
+            continue
+        major, minor = (int(n) for n in fields[2].split(":"))
+        # Space, tab, newline and backslash appear as octal escapes.
+        point = re.sub(r"\\([0-7]{3})", lambda e: chr(int(e.group(1), 8)), fields[4])
+        # fusectl names a connection after the kernel's dev_t of the mount.
+        mounts[_mount_key(point)] = (major << 20) | minor
+    return mounts
+
+
+def _holds_dev_fuse(pid_dir: Path) -> bool:
+    """Has this process /dev/fuse open - is it serving a mount, not just trying to?"""
+    try:
+        return any(os.readlink(fd) == "/dev/fuse" for fd in (pid_dir / "fd").iterdir())
+    except OSError:
+        return False
+
+
+def _mount_owner(mountpoint: Path) -> "tuple[int, str] | None":
+    """
+    The rclone process serving `mountpoint`: (PID, unit), or None if none is.
+
+    unit is the service whose main process it is, '' when it runs outside one
+    (started by hand, say).  A unit stuck retrying a mount that is already
+    taken starts rclones for the same mountpoint too; holding /dev/fuse tells
+    the one that serves it apart.  Only /proc is read, never the mount itself.
+    """
+    want = _mount_key(mountpoint)
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            argv = (pid_dir / "cmdline").read_bytes().decode(errors="replace").split("\0")
+            if os.path.basename(argv[0]) != "rclone" or "mount" not in argv \
+                    or not any(_mount_key(a) == want for a in argv if a.startswith("/")):
+                continue
+            if not _holds_dev_fuse(pid_dir):
+                continue
+            cgroup = (pid_dir / "cgroup").read_text()
+        except OSError:
+            continue   # gone meanwhile, or not ours to read
+        pid = int(pid_dir.name)
+        path = next((line[3:] for line in cgroup.splitlines() if line.startswith("0::")), "")
+        unit = path.rstrip("/").rsplit("/", 1)[-1]
+        if not unit.endswith(".service") or _unit_main_pid(unit) != pid:
+            unit = ""
+        return pid, unit
+    return None
+
+
+# The probe per mountpoint that was started last.  One stuck in a hung mount
+# stays stuck until the mount dies, so no second one is started beside it:
+# before, every poll left one more thread behind, and each one alone was
+# enough for the kernel to abort a suspend.
+_probes: "dict[str, threading.Event]" = {}
+_probes_lock = threading.Lock()
+
+
+def _probe_read(path: Path, done: threading.Event) -> None:
+    try:
+        with os.scandir(path) as it:
+            next(iter(it), None)
+    except Exception:
+        pass
+    finally:
+        done.set()
+
+
 def _probe_readable(path: Path, timeout: float = _MOUNT_PROBE_TIMEOUT) -> bool:
     """
     Can we list `path` within `timeout` seconds?
 
     A hung FUSE mount blocks the calling thread indefinitely, so the read runs in
     a throwaway daemon thread: if it does not come back in time we call the mount
-    stale and let the thread die with the process.
+    stale and let the thread die with the process, or with the mount.  While it
+    hangs, later calls wait on it instead of starting another.
     """
-    done = threading.Event()
-
-    def _read():
-        try:
-            with os.scandir(path) as it:
-                next(iter(it), None)
-        except Exception:
-            pass
-        finally:
-            done.set()
-
-    threading.Thread(target=_read, name="mount-probe", daemon=True).start()
+    key = _mount_key(path)
+    with _probes_lock:
+        done = _probes.get(key)
+        if done is None or done.is_set():
+            done = threading.Event()
+            _probes[key] = done
+            threading.Thread(target=_probe_read, args=(path, done),
+                             name="mount-probe", daemon=True).start()
     return done.wait(timeout)
 
 
@@ -1059,19 +1164,24 @@ def mount_health(m: Mount) -> dict:
     """Current state of one mount, cheapest check first."""
     info = {"name": m.name, "remote": m.remote, "mountpoint": str(m.mountpoint),
             "unit": m.unit, "unit_state": None, "state": MOUNT_OK,
+            "owner_pid": None, "owner_unit": None,
             "pending_uploads": 0, "pending_bytes": 0, "oldest_pending": None,
             "pending_sample": [], "cache_root": str(vfs_cache_root(m))}
 
     if m.unit:
         info["unit_state"] = _unit_active_state(m.unit)
 
-    if not m.mountpoint.exists():
-        info["state"] = MOUNT_UNMOUNTED
+    if _mount_key(m.mountpoint) not in _fuse_mounts():
+        # Not mounted, so these look at the local directory, not at a FUSE daemon.
+        if m.mountpoint.exists() and _dir_has_entries(m.mountpoint):
+            info["state"] = MOUNT_SHADOWED
+        else:
+            info["state"] = MOUNT_UNMOUNTED
         return info
 
-    if not os.path.ismount(m.mountpoint):
-        info["state"] = MOUNT_SHADOWED if _dir_has_entries(m.mountpoint) else MOUNT_UNMOUNTED
-        return info
+    owner = _mount_owner(m.mountpoint)
+    if owner:
+        info["owner_pid"], info["owner_unit"] = owner
 
     if not _probe_readable(m.mountpoint):
         info["state"] = MOUNT_STALE
@@ -1085,9 +1195,13 @@ def mount_health(m: Mount) -> dict:
                 oldest_pending=int(backlog["oldest"]) or None,
                 pending_sample=backlog["sample"])
 
-    # A failed unit on top of that is still worth saying, and outranks a
+    # Served by another unit outranks the rest: the unit state, cache and
+    # settings judged below are the configured unit's, not those of the one
+    # actually running.  A failed unit is still worth saying, and outranks a
     # backlog: the backlog is a consequence once the mount itself is broken.
-    if info["unit_state"] == "failed":
+    if owner and m.unit and owner[1] != m.unit:
+        info["state"] = MOUNT_FOREIGN
+    elif info["unit_state"] == "failed":
         info["state"] = MOUNT_UNIT_FAILED
     elif backlog["count"]:
         info["state"] = MOUNT_UPLOAD_STUCK
@@ -1109,6 +1223,9 @@ _MOUNT_MESSAGE = {
     MOUNT_UPLOAD_STUCK: ("Warning: uploads are not going through",
                          "cannot upload what was written to it.\n"
                          "Those files exist only in the local cache."),
+    MOUNT_FOREIGN:     ("Cloud drive run by another unit",
+                        "is mounted, but not by its configured unit.\n"
+                        "The configured settings do not apply to it."),
 }
 
 
@@ -1131,6 +1248,9 @@ def check_mount(m: Mount, offline: "bool | None" = None) -> str:
 
     summary, detail = _MOUNT_MESSAGE[state]
     body = f"{m.name} {detail}"
+    if info["owner_pid"] and info["owner_unit"] != m.unit:
+        body += (f"\nheld by {info['owner_unit'] or 'a process outside any service'}"
+                 f" (PID {info['owner_pid']})")
     if state == MOUNT_UPLOAD_STUCK:
         body += (f"\n{info['pending_uploads']} file(s), "
                  f"{_human_bytes(info['pending_bytes'])}, oldest "
@@ -1280,8 +1400,9 @@ def mount_watch_loop(stop_event: threading.Event):
 # dependency is added.  busctl would not do: 'busctl monitor' needs root.
 
 # logind waits InhibitDelayMaxSec (5 s by default) for a delay lock, then
-# suspends anyway.  Stopping the units must fit inside that.
-_SLEEP_STOP_TIMEOUT = 4.0
+# suspends anyway.  Stopping the units gets this much of it; cutting loose
+# what is still mounted afterwards takes well under a second.
+_SLEEP_STOP_TIMEOUT = 3.0
 _PREPARE_FOR_SLEEP = "org.freedesktop.login1.Manager.PrepareForSleep"
 
 
@@ -1335,31 +1456,80 @@ def _writers_under(path: Path) -> "list[str]":
     return writers
 
 
+def _detach_mount(mountpoint: str, conn: int) -> None:
+    """
+    Cut a FUSE mount loose without asking the daemon behind it.
+
+    Aborting the connection fails every request in flight with ENOTCONN, which
+    is what frees a task stuck in the mount so the kernel can freeze it; the
+    lazy unmount then takes the mountpoint away.  rclone exits on its own once
+    its connection is gone.  Both need no more than the mount owner's rights.
+    """
+    try:
+        Path(f"/sys/fs/fuse/connections/{conn}/abort").write_text("1")
+    except OSError as e:
+        log.warning("Could not abort the FUSE connection of %s: %s", mountpoint, e)
+    # fuse3 ships only fusermount3; fusermount is fuse2's, often not installed.
+    fusermount = shutil.which("fusermount3") or shutil.which("fusermount") or "fusermount"
+    try:
+        subprocess.run([fusermount, "-uz", mountpoint], capture_output=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("Could not unmount %s: %s", mountpoint, e)
+
+
 def _stop_mounts_for_sleep() -> "list[str]":
-    """Stop every active mount unit that is safe to stop.  Returns the stopped units."""
-    active = [m for m in CFG.mounts if m.unit and _unit_active_state(m.unit) == "active"]
-    units = []
-    for m in active:
+    """
+    Take every configured mount down that is safe to.  Returns the units to
+    start again on wake.
+
+    What counts is whether the mountpoint is mounted, not whether its unit is
+    active: a mount served by another unit, or by hand, hangs a suspend just
+    the same - and the configured unit, failing with "already mounted", is
+    never active.  The unit serving it is stopped too; what is still mounted
+    once the stop has had its time is cut loose.
+    """
+    targets = []   # (mount, mountpoint, unit serving it)
+    for m in CFG.mounts:
+        if _mount_key(m.mountpoint) not in _fuse_mounts():
+            continue
         writers = _writers_under(m.mountpoint)
         if writers:
             # Better a mount that may hang for a minute after wake than a
             # document that cannot be saved.  The timeouts cover this case.
             log.warning("[%s] kept mounted across sleep - open for writing by %s",
                         m.name, ", ".join(writers))
-        else:
-            units.append(m.unit)
-    if not units:
+            continue
+        owner = _mount_owner(m.mountpoint)
+        owner_unit = owner[1] if owner else ""
+        if owner and owner_unit != m.unit:
+            log.warning("[%s] mounted by %s (PID %d), not %s - stopping that; %s takes over on wake",
+                        m.name, owner_unit or "a process outside any service", owner[0],
+                        m.unit, m.unit)
+        targets.append((m, _mount_key(m.mountpoint), owner_unit))
+    if not targets:
+        log.info("Sleep announced - no mount to stop")
         return []
-    log.info("Sleep announced - stopping %s", ", ".join(units))
-    try:
-        # One call, so systemd stops them in parallel.
-        subprocess.run(["systemctl", "--user", "stop", *units],
-                       capture_output=True, timeout=_SLEEP_STOP_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        # The stop jobs carry on inside systemd; we only stop waiting for them.
-        log.warning("Mounts did not stop within %.0fs - letting the system sleep anyway",
-                    _SLEEP_STOP_TIMEOUT)
-    return units
+
+    # The configured unit as well, even when it does not serve the mount: that
+    # ends its retry loop, and the start on wake then finds the mountpoint free.
+    units = list(dict.fromkeys(u for m, _, owner_unit in targets
+                               for u in (m.unit, owner_unit) if u))
+    if units:
+        log.info("Sleep announced - stopping %s", ", ".join(units))
+        try:
+            # One call, so systemd stops them in parallel.
+            subprocess.run(["systemctl", "--user", "stop", *units],
+                           capture_output=True, timeout=_SLEEP_STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # The stop jobs carry on inside systemd; we only stop waiting for them.
+            log.warning("Mount units did not stop within %.0fs", _SLEEP_STOP_TIMEOUT)
+
+    still = _fuse_mounts()
+    for m, point, _ in targets:
+        if point in still:
+            log.warning("[%s] still mounted - cutting it loose", m.name)
+            _detach_mount(point, still[point])
+    return [m.unit for m, _, _ in targets if m.unit]
 
 
 def sleep_guard() -> int:
@@ -1816,6 +1986,7 @@ _MOUNT_STYLE = {
     MOUNT_OUTDATED:    ("🔄", "SETTINGS OUTDATED", "yellow"),
     MOUNT_SHADOWED:    ("🚨", "HIDDEN FILES",     "magenta"),
     MOUNT_UPLOAD_STUCK: ("📤", "UPLOADS STUCK",    "magenta"),
+    MOUNT_FOREIGN:     ("🔀", "FOREIGN OWNER",    "yellow"),
 }
 
 
@@ -1963,6 +2134,10 @@ def print_status(as_json: bool = False) -> int:
                 ustate = m["unit_state"] or "?"
                 ucolor = "green" if ustate == "active" else "red"
                 print(f"  {label('Unit')}{m['unit']} {c('(' + ustate + ')', ucolor)}")
+            if m["owner_pid"] and m["owner_unit"] != m["unit"]:
+                held = m["owner_unit"] or "no service"
+                print(f"  {label('Held by')}{c(held, 'yellow', 'bold')} "
+                      f"{c('(PID ' + str(m['owner_pid']) + ')', 'grey')}")
             if m["state"] != MOUNT_OK:
                 print(f"  {label('Last ok')}{m['last_ok']} {c('(' + m['last_ok_ago'] + ')', 'grey')}")
                 if m["state"] == MOUNT_SHADOWED:
@@ -1970,6 +2145,11 @@ def print_status(as_json: bool = False) -> int:
                     print(f"  {label('')}{c('they become invisible once it is mounted - move them away first', 'magenta')}")
                 elif m["state"] == MOUNT_OUTDATED:
                     print(f"  {label('Fix')}{c('cloud-sync --export-mount-units', 'bold')}"
+                          f"{c(', then systemctl --user restart ' + m['unit'], 'grey')}")
+                elif m["state"] == MOUNT_FOREIGN:
+                    stop = (f"systemctl --user disable --now {m['owner_unit']}" if m["owner_unit"]
+                            else f"kill {m['owner_pid']}")
+                    print(f"  {label('Fix')}{c(stop, 'bold')}"
                           f"{c(', then systemctl --user restart ' + m['unit'], 'grey')}")
             if m["pending_uploads"]:
                 print(f"  {label('Uploads')}📤 {c(str(m['pending_uploads']) + ' file(s)', 'magenta', 'bold')} "
@@ -2092,8 +2272,9 @@ def print_pairs() -> None:
         if CFG.pairs:
             print()
         print(rule("🌐 Network lookup"))
+    fuse = _fuse_mounts()
     for m in CFG.mounts:
-        mounted = os.path.ismount(m.mountpoint)
+        mounted = _mount_key(m.mountpoint) in fuse
         state = f"✅ {c('mounted', 'green')}" if mounted \
             else f"⛔ {c('not mounted', 'red', 'bold')}"
         print(f"  {c(m.name, 'bold', 'blue')}")
